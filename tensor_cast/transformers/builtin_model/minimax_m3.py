@@ -1,0 +1,140 @@
+import logging
+
+import torch
+
+from tensor_cast.transformers.transformations import (
+    maybe_enable_mtp,
+    maybe_reuse_layers,
+    patch_attention,
+    patch_moe,
+    patch_rotary_emb,
+    quantize_model,
+    shard_model,
+    wrap_model,
+)
+
+from ..custom_model_registry import (
+    ModelProfile,
+    register_custom_model,
+    register_model_profile,
+)
+from ..model import TransformerModel
+from ...layers.minimax_m3_attention import MiniMaxM3AttentionWrapper
+
+logger = logging.getLogger(__name__)
+
+
+def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
+    """Replace MiniMax-M3 attention layers with TensorCast wrappers.
+
+    Dense layers keep using standard attention ops.
+    Sparse layers are wrapped to call minimax_indexer + minimax_sparse_attention.
+    """
+    sparse_cfg = None
+    text_config = model.text_config
+
+    if hasattr(text_config, "sparse_attention_config"):
+        sparse_cfg = text_config.sparse_attention_config
+    if sparse_cfg is None or not sparse_cfg.get("use_sparse_attention", False):
+        logger.info("No sparse_attention_config found, skipping M3 attention patch")
+        return model
+
+    sparse_attention_freq = sparse_cfg.get("sparse_attention_freq", [])
+    num_indexer_heads = sparse_cfg.get("sparse_num_index_heads", 4)
+    indexer_head_dim = sparse_cfg.get("sparse_index_dim", 128)
+    indexer_rope_dim = getattr(text_config, "rotary_dim", 64)
+    topk_blocks = sparse_cfg.get("sparse_topk_blocks", 16)
+    block_size = sparse_cfg.get("sparse_block_size", 128)
+    local_blocks = sparse_cfg.get("sparse_local_block", 1)
+
+    hidden_size = text_config.hidden_size
+    num_q_heads = text_config.num_attention_heads
+    num_kv_heads = text_config.num_key_value_heads
+    head_dim = getattr(text_config, "head_dim", hidden_size // num_q_heads)
+
+    tp_size = 1
+    tp_rank = 0
+    if model.parallel_group_manager is not None and model.parallel_group_manager.tp_group is not None:
+        tp_size = model.parallel_group_manager.tp_group.world_size
+        tp_rank = model.parallel_group_manager.tp_group.rank_in_group
+
+    per_rank_q_heads = num_q_heads // tp_size
+    per_rank_kv_heads = num_kv_heads // tp_size
+    per_rank_indexer_heads = num_indexer_heads // tp_size if num_indexer_heads >= tp_size else num_indexer_heads
+
+    unwrapped = model.unwrap()
+    if not hasattr(unwrapped, "layers"):
+        language_model = unwrapped
+        if hasattr(unwrapped, "language_model"):
+            language_model = unwrapped.language_model
+        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+            unwrapped = language_model.model
+        else:
+            logger.warning("Cannot find layers for M3 attention patch")
+            return model
+
+    for layer_idx, layer in enumerate(unwrapped.layers):
+        self_attn = layer
+        while hasattr(self_attn, "_inner"):
+            self_attn = self_attn._inner
+        if hasattr(self_attn, "self_attn"):
+            self_attn = self_attn.self_attn
+
+        is_sparse = (
+            layer_idx < len(sparse_attention_freq) and sparse_attention_freq[layer_idx] == 1
+        )
+
+        wrapper = MiniMaxM3AttentionWrapper(
+            original_module=self_attn,
+            is_sparse_layer=is_sparse,
+            hidden_size=hidden_size,
+            num_q_heads=per_rank_q_heads,
+            num_kv_heads=per_rank_kv_heads,
+            head_dim=head_dim,
+            num_indexer_heads=per_rank_indexer_heads,
+            indexer_head_dim=indexer_head_dim,
+            indexer_rope_dim=indexer_rope_dim,
+            topk_blocks=topk_blocks,
+            block_size=block_size,
+            local_blocks=local_blocks,
+        )
+
+        parent = layer
+        while hasattr(parent, "_inner") and hasattr(parent._inner, "self_attn"):
+            parent = parent._inner
+        if hasattr(parent, "self_attn"):
+            parent.self_attn = wrapper
+        else:
+            logger.warning("Could not replace self_attn for layer %d", layer_idx)
+
+    return model
+
+
+@register_custom_model("minimax_m3_vl")
+def _(model: TransformerModel):
+    model = wrap_model(model)
+    model = maybe_enable_mtp(model)
+    model = maybe_reuse_layers(model)
+    model = patch_rotary_emb(model)
+    model = patch_attention(model)
+    model = patch_minimax_m3_attention(model)
+    model = patch_moe(model)
+    model = quantize_model(model)
+    model = shard_model(model)
+    return model
+
+
+register_model_profile(
+    ModelProfile(
+        model_type="minimax_m3_vl",
+        moe_module_name="MiniMaxM3SparseMoeBlock",
+        moe_gate_returns_raw_logits=False,
+        moe_num_experts_key="num_local_experts",
+        mtp_block_module_name="MiniMaxM3DecoderLayer",
+        language_layers_path_str="language_model.model.layers",
+        language_module_path="language_model",
+        visual_module_path="vision_tower",
+        visual_layers_module_path="vision_tower.encoder.blocks",
+        visual_layers_path_str="vision_tower.encoder.blocks",
+    )
+)
