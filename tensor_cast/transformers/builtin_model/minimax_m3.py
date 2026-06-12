@@ -4,7 +4,6 @@ import torch
 
 from tensor_cast.transformers.transformations import (
     maybe_enable_mtp,
-    maybe_reuse_layers,
     patch_attention,
     patch_moe,
     patch_rotary_emb,
@@ -24,12 +23,72 @@ from ...layers.minimax_m3_attention import MiniMaxM3AttentionWrapper
 logger = logging.getLogger(__name__)
 
 
-def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
-    """Replace MiniMax-M3 attention layers with TensorCast wrappers.
+class MiniMaxM3ExpertMLP(torch.nn.Module):
+    def __init__(self, original_experts_module, expert_idx=None):
+        super().__init__()
+        if isinstance(original_experts_module, torch.nn.ModuleList) and expert_idx is None:
+            expert = original_experts_module[0]
+        elif expert_idx is not None:
+            expert = original_experts_module[expert_idx]
+        else:
+            expert = original_experts_module
+        self.hidden_size = expert.hidden_size
+        self.intermediate_size = expert.intermediate_size
+        self.act_fn = expert.act_fn
 
-    Dense layers keep using standard attention ops.
-    Sparse layers are wrapped to call minimax_indexer + minimax_sparse_attention.
-    """
+        self.gate_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = torch.nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        with torch.no_grad():
+            self.gate_proj.weight.copy_(expert.gate_proj.weight)
+            self.up_proj.weight.copy_(expert.up_proj.weight)
+            self.down_proj.weight.copy_(expert.down_proj.weight)
+
+    def forward(self, hidden_states):
+        return self.down_proj(self.act_fn(torch.cat([self.gate_proj(hidden_states), self.up_proj(hidden_states)], dim=-1)))
+
+
+class _MoeReturnCompat(torch.nn.Module):
+    def __init__(self, moe):
+        super().__init__()
+        self._moe = moe
+
+    def forward(self, hidden_states):
+        result = self._moe(hidden_states)
+        if isinstance(result, tuple):
+            return result
+        return result, None
+
+
+def _patch_minimax_m3_hf_config(hf_config, model_id):
+    if hasattr(hf_config, "text_config") and not hasattr(hf_config, "num_hidden_layers"):
+        tc = hf_config.text_config
+        for attr in ["num_hidden_layers", "hidden_size", "num_attention_heads",
+                      "num_key_value_heads", "head_dim", "intermediate_size",
+                      "vocab_size", "rms_norm_eps", "max_position_embeddings"]:
+            if hasattr(tc, attr) and not hasattr(hf_config, attr):
+                try:
+                    setattr(hf_config, attr, getattr(tc, attr))
+                except Exception:
+                    pass
+
+
+def _patch_m3_moe_return_compat(model):
+    unwrapped = model.unwrap()
+    if not hasattr(unwrapped, "layers"):
+        if hasattr(unwrapped, "model") and hasattr(unwrapped.model, "layers"):
+            unwrapped = unwrapped.model
+        else:
+            return model
+    for layer in unwrapped.layers:
+        block_sparse_moe = getattr(layer, "block_sparse_moe", None)
+        if block_sparse_moe is not None and not isinstance(block_sparse_moe, _MoeReturnCompat):
+            layer.block_sparse_moe = _MoeReturnCompat(block_sparse_moe)
+    return model
+
+
+def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
     sparse_cfg = None
     text_config = model.text_config
 
@@ -53,11 +112,8 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
     head_dim = getattr(text_config, "head_dim", hidden_size // num_q_heads)
 
     tp_size = 1
-    tp_rank = 0
     if model.parallel_group_manager is not None and model.parallel_group_manager.tp_group is not None:
         tp_size = model.parallel_group_manager.tp_group.world_size
-        tp_rank = model.parallel_group_manager.tp_group.rank_in_group
-
     per_rank_q_heads = num_q_heads // tp_size
     per_rank_kv_heads = num_kv_heads // tp_size
     per_rank_indexer_heads = num_indexer_heads // tp_size if num_indexer_heads >= tp_size else num_indexer_heads
@@ -114,11 +170,10 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
 def _(model: TransformerModel):
     model = wrap_model(model)
     model = maybe_enable_mtp(model)
-    model = maybe_reuse_layers(model)
-    model = patch_rotary_emb(model)
-    model = patch_attention(model)
     model = patch_minimax_m3_attention(model)
+    model = patch_attention(model)
     model = patch_moe(model)
+    model = _patch_m3_moe_return_compat(model)
     model = quantize_model(model)
     model = shard_model(model)
     return model
@@ -128,13 +183,15 @@ register_model_profile(
     ModelProfile(
         model_type="minimax_m3_vl",
         moe_module_name="MiniMaxM3SparseMoeBlock",
-        moe_gate_returns_raw_logits=False,
+        moe_gate_returns_raw_logits=True,
         moe_num_experts_key="num_local_experts",
         mtp_block_module_name="MiniMaxM3DecoderLayer",
-        language_layers_path_str="language_model.model.layers",
-        language_module_path="language_model",
-        visual_module_path="vision_tower",
-        visual_layers_module_path="vision_tower.encoder.blocks",
-        visual_layers_path_str="vision_tower.encoder.blocks",
+        hf_config_patch_method=_patch_minimax_m3_hf_config,
+        language_layers_path_str="model.layers",
+        language_module_path="model",
+        moe_field_names_override={
+            "shared_experts": "shared_experts",
+        },
+        custom_expert_module_type=MiniMaxM3ExpertMLP,
     )
 )
