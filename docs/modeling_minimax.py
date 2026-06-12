@@ -14,7 +14,8 @@
 # limitations under the License.
 """PyTorch MiniMax-M3 model."""
 
-from typing import Optional, Union
+import math
+from typing import Optional, Union, List
 from collections.abc import Callable
 
 import torch
@@ -64,6 +65,55 @@ class MiniMaxM3RMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class MiniMaxM3StandardRMSNorm(nn.Module):
+    """Standard RMSNorm: weight * rms_norm(hidden)."""
+
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class MiniMaxM3MultiHeadRMSNorm(nn.Module):
+    """Per-head RMSNorm with optional layernorm-1p (Gemma-style) bias."""
+
+    def __init__(self, num_heads, head_dim, eps=1e-6, apply_layernorm_1p=False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.weight = nn.Parameter(torch.ones(num_heads, head_dim, dtype=torch.float32))
+        self.variance_epsilon = eps
+        self.apply_layernorm_1p = apply_layernorm_1p
+
+    def forward(self, hidden_states):
+        orig_dtype = hidden_states.dtype
+        hidden_states = hidden_states.view(-1, self.num_heads, self.head_dim).to(torch.float32)
+        variance = hidden_states.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        if self.apply_layernorm_1p:
+            hidden_states = hidden_states * (1.0 + self.weight[None, ...])
+        else:
+            hidden_states = hidden_states * self.weight[None, ...]
+        hidden_states = hidden_states.view(-1, self.num_heads * self.head_dim)
+        return hidden_states.to(orig_dtype)
+
+
+def _get_norm_class(use_gemma_norm):
+    if use_gemma_norm:
+        return MiniMaxM3RMSNorm
+    return MiniMaxM3StandardRMSNorm
 
 
 class SwigluOAIAndMul(torch.nn.Module):
@@ -234,10 +284,51 @@ def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class MiniMaxM3Attention(nn.Module):
-    """Multi-headed attention with per-head QK LayerNorm and partial rotary embeddings."""
+def _get_sparse_attention_layer_ids(config):
+    sparse_cfg = getattr(config, "sparse_attention_config", None)
+    if sparse_cfg is None:
+        return list(range(config.num_hidden_layers)), []
+    use_sparse = sparse_cfg.get("use_sparse_attention", False) if isinstance(sparse_cfg, dict) else getattr(sparse_cfg, "use_sparse_attention", False)
+    if not use_sparse:
+        return list(range(config.num_hidden_layers)), []
+    freq = sparse_cfg.get("sparse_attention_freq", []) if isinstance(sparse_cfg, dict) else getattr(sparse_cfg, "sparse_attention_freq", [])
+    dense_ids = [i for i, f in enumerate(freq) if f == 0]
+    sparse_ids = [i for i, f in enumerate(freq) if f != 0]
+    if len(freq) < config.num_hidden_layers:
+        dense_ids += list(range(len(freq), config.num_hidden_layers))
+    return dense_ids, sparse_ids
 
-    def __init__(self, config, layer_idx):
+
+def _get_sparse_disable_value_layer_ids(config):
+    sparse_cfg = getattr(config, "sparse_attention_config", None)
+    if sparse_cfg is None:
+        return set()
+    if isinstance(sparse_cfg, dict):
+        disable_list = sparse_cfg.get("sparse_disable_index_value", [])
+        if not disable_list:
+            disable_list = sparse_cfg.get("sparse_disable_value", [])
+    else:
+        disable_list = getattr(sparse_cfg, "sparse_disable_index_value", [])
+        if not disable_list:
+            disable_list = getattr(sparse_cfg, "sparse_disable_value", [])
+    return set(i for i, v in enumerate(disable_list) if v)
+
+
+class MiniMaxM3Attention(nn.Module):
+    """Multi-headed attention with QK normalization, partial rotary embeddings,
+    and optional sparse attention index branch.
+
+    Supports two modes selected by ``is_sparse_attention_layer``:
+
+    * Dense (default): standard QKV attention.
+    * Sparse: extra index branch (index_q/k/v_proj + index_o_proj) whose
+      outputs are computed alongside the dense attention and summed into the
+      dense output. In a production inference framework this would be
+      dispatched to a sparse attention backend; here we compute the index
+      branch as a parallel attention path with reduced dimensionality.
+    """
+
+    def __init__(self, config, layer_idx, is_sparse_attention_layer=False, disable_index_value=False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -246,19 +337,155 @@ class MiniMaxM3Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", None) or self.hidden_size // self.num_heads
-        self.rotary_dim = config.rotary_dim
+        self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
         self.scaling = self.head_dim ** -0.5
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
         self.is_causal = True
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.is_sparse_attention_layer = is_sparse_attention_layer
+        self.disable_index_value = is_sparse_attention_layer and disable_index_value
+
+        self.qk_norm_type = getattr(config, "qk_norm_type", "per_head")
+        self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
+        self.attention_output_gate = getattr(config, "attention_output_gate", False)
+
+        if self.attention_output_gate:
+            self.q_proj = nn.Linear(
+                self.hidden_size, self.num_heads * self.head_dim * 2, bias=False
+            )
+        else:
+            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        # Per-head QK LayerNorm (M3 uses per_head, unlike M2's full-head norm)
-        self.q_norm = MiniMaxM3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MiniMaxM3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self._init_qk_norm(config)
+
+        if self.is_sparse_attention_layer:
+            self._init_sparse_index_branch(config)
+
+    def _init_qk_norm(self, config):
+        norm_cls = _get_norm_class(self.use_gemma_norm)
+
+        if self.qk_norm_type == "per_layer":
+            self.q_norm = norm_cls(self.num_heads * self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = norm_cls(self.num_key_value_heads * self.head_dim, eps=config.rms_norm_eps)
+        elif self.qk_norm_type == "per_head":
+            self.q_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        elif self.qk_norm_type == "multi_head":
+            self.q_norm = MiniMaxM3MultiHeadRMSNorm(
+                self.num_heads, self.head_dim,
+                eps=config.rms_norm_eps,
+                apply_layernorm_1p=self.use_gemma_norm,
+            )
+            self.k_norm = MiniMaxM3MultiHeadRMSNorm(
+                self.num_key_value_heads, self.head_dim,
+                eps=config.rms_norm_eps,
+                apply_layernorm_1p=self.use_gemma_norm,
+            )
+        else:
+            raise ValueError(f"Invalid qk_norm_type: {self.qk_norm_type}")
+
+    def _init_sparse_index_branch(self, config):
+        sparse_cfg = config.sparse_attention_config
+        if isinstance(sparse_cfg, dict):
+            self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
+            self.idx_head_dim = sparse_cfg["sparse_index_dim"]
+        else:
+            self.total_idx_heads = sparse_cfg.sparse_num_index_heads
+            self.idx_head_dim = sparse_cfg.sparse_index_dim
+
+        self.index_q_proj = nn.Linear(
+            self.hidden_size, self.total_idx_heads * self.idx_head_dim, bias=False
+        )
+        self.index_k_proj = nn.Linear(
+            self.hidden_size, self.idx_head_dim, bias=False
+        )
+        if self.disable_index_value:
+            self.index_v_proj = None
+            self.index_o_proj = None
+        else:
+            self.index_v_proj = nn.Linear(
+                self.hidden_size, self.idx_head_dim, bias=False
+            )
+            self.index_o_proj = nn.Linear(
+                self.total_idx_heads * self.idx_head_dim, self.hidden_size, bias=False
+            )
+
+        norm_cls = _get_norm_class(self.use_gemma_norm)
+        self.index_q_norm = norm_cls(self.idx_head_dim, eps=config.rms_norm_eps)
+        self.index_k_norm = norm_cls(self.idx_head_dim, eps=config.rms_norm_eps)
+
+    def _qk_norm(self, query_states, key_states):
+        if self.qk_norm_type == "per_layer":
+            orig_q_shape = query_states.shape
+            orig_k_shape = key_states.shape
+            q_flat = query_states.reshape(-1, self.num_heads * self.head_dim).contiguous()
+            k_flat = key_states.reshape(-1, self.num_key_value_heads * self.head_dim).contiguous()
+            q_normed = self.q_norm(q_flat).reshape(orig_q_shape)
+            k_normed = self.k_norm(k_flat).reshape(orig_k_shape)
+        elif self.qk_norm_type == "per_head":
+            orig_q_shape = query_states.shape
+            orig_k_shape = key_states.shape
+            q_flat = query_states.reshape(-1, self.head_dim).contiguous()
+            k_flat = key_states.reshape(-1, self.head_dim).contiguous()
+            q_normed = self.q_norm(q_flat).reshape(orig_q_shape)
+            k_normed = self.k_norm(k_flat).reshape(orig_k_shape)
+        elif self.qk_norm_type == "multi_head":
+            orig_q_shape = query_states.shape
+            orig_k_shape = key_states.shape
+            q_flat = query_states.reshape(-1, self.num_heads * self.head_dim).contiguous()
+            k_flat = key_states.reshape(-1, self.num_key_value_heads * self.head_dim).contiguous()
+            q_normed = self.q_norm(q_flat).reshape(orig_q_shape)
+            k_normed = self.k_norm(k_flat).reshape(orig_k_shape)
+        else:
+            raise ValueError(f"Invalid qk_norm_type: {self.qk_norm_type}")
+        return q_normed, k_normed
+
+    def _index_qk_norm(self, idx_q, idx_k):
+        idx_q_shape = idx_q.shape
+        idx_k_shape = idx_k.shape
+        idx_q = self.index_q_norm(idx_q.reshape(-1, self.idx_head_dim)).reshape(idx_q_shape)
+        idx_k = self.index_k_norm(idx_k.reshape(-1, self.idx_head_dim)).reshape(idx_k_shape)
+        return idx_q, idx_k
+
+    def _sparse_index_forward(self, hidden_states, cos, sin, input_shape):
+        idx_q = self.index_q_proj(hidden_states)
+        idx_k = self.index_k_proj(hidden_states)
+        if not self.disable_index_value:
+            idx_v = self.index_v_proj(hidden_states)
+        else:
+            idx_v = None
+
+        idx_q = idx_q.view(*input_shape, -1, self.idx_head_dim)
+        idx_k = idx_k.view(*input_shape, -1, self.idx_head_dim)
+
+        idx_q, idx_k = self._index_qk_norm(idx_q, idx_k)
+
+        idx_q = idx_q.transpose(1, 2)
+        idx_k = idx_k.transpose(1, 2)
+        if idx_v is not None:
+            idx_v = idx_v.view(*input_shape, -1, self.idx_head_dim).transpose(1, 2)
+
+        idx_q, idx_k = _apply_rotary_pos_emb(idx_q, idx_k, cos, sin)
+
+        if idx_v is not None:
+            idx_scores = torch.matmul(idx_q, idx_k.transpose(2, 3)) * (self.idx_head_dim ** -0.5)
+            seq_len = idx_scores.shape[-1]
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=idx_scores.device, dtype=idx_scores.dtype),
+                diagonal=1,
+            )
+            idx_scores = idx_scores + causal_mask
+            idx_weights = F.softmax(idx_scores, dim=-1, dtype=torch.float32).to(idx_q.dtype)
+            idx_attn = torch.matmul(idx_weights, idx_v)
+            idx_attn = idx_attn.transpose(1, 2).contiguous().reshape(*input_shape, -1)
+            idx_output = self.index_o_proj(idx_attn)
+        else:
+            idx_output = None
+
+        return idx_output
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -273,23 +500,25 @@ class MiniMaxM3Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states)
+        if self.attention_output_gate:
+            q_gate = self.q_proj(hidden_states)
+            q_gate = q_gate.view(*input_shape, -1, 2, self.head_dim)
+            query_states = q_gate[..., 0, :].reshape(*input_shape, -1)
+            gate = q_gate[..., 1, :].reshape(*input_shape, -1)
+        else:
+            query_states = self.q_proj(hidden_states)
+            gate = None
+
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Per-head QK LayerNorm: reshape to (..., num_heads, head_dim) then norm
         query_states = query_states.view(*input_shape, -1, self.head_dim)
         key_states = key_states.view(*input_shape, -1, self.head_dim)
 
-        # Per-head norm
-        q_flat = query_states.reshape(-1, self.head_dim).contiguous()
-        k_flat = key_states.reshape(-1, self.head_dim).contiguous()
-        q_normed = self.q_norm(q_flat).reshape(query_states.shape)
-        k_normed = self.k_norm(k_flat).reshape(key_states.shape)
+        query_states, key_states = self._qk_norm(query_states, key_states)
 
-        # Transpose to (batch, num_heads, seq_len, head_dim)
-        query_states = q_normed.transpose(1, 2)
-        key_states = k_normed.transpose(1, 2)
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -315,19 +544,60 @@ class MiniMaxM3Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+
+        if self.attention_output_gate and gate is not None:
+            gate = torch.sigmoid(gate.float())
+            attn_output = (attn_output * gate).to(attn_output.dtype)
+
         attn_output = self.o_proj(attn_output)
+
+        if self.is_sparse_attention_layer:
+            idx_output = self._sparse_index_forward(hidden_states, cos, sin, input_shape)
+            if idx_output is not None:
+                attn_output = attn_output + idx_output
+
         return attn_output, attn_weights
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
+    """MiniMax Decoder Layer with MoE and optional sparse attention support.
+
+    The attention block can be either dense or sparse depending on
+    config.sparse_attention_config:
+
+    * If sparse_attention_config is None (or absent), all layers run
+      dense attention.
+    * If present, the per-layer dense/sparse split is read from
+      sparse_attention_config['sparse_attention_freq'].
+    """
+
     def __init__(self, config, layer_idx):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
-        self.self_attn = MiniMaxM3Attention(config, layer_idx)
+        sparse_attention_config = getattr(config, "sparse_attention_config", None)
+        use_sparse = False
+        if sparse_attention_config is not None:
+            if isinstance(sparse_attention_config, dict):
+                use_sparse = sparse_attention_config.get("use_sparse_attention", False)
+            else:
+                use_sparse = getattr(sparse_attention_config, "use_sparse_attention", False)
+        if use_sparse:
+            _, sparse_layer_ids = _get_sparse_attention_layer_ids(config)
+            is_sparse_attention_layer = layer_idx in sparse_layer_ids
+            disable_value_layer_ids = _get_sparse_disable_value_layer_ids(config)
+            disable_index_value = layer_idx in disable_value_layer_ids
+        else:
+            is_sparse_attention_layer = False
+            disable_index_value = False
 
-        # MoE layer frequency: layers with moe_layer_freq != 0 use MoE, else dense MLP
+        self.self_attn = MiniMaxM3Attention(
+            config, layer_idx,
+            is_sparse_attention_layer=is_sparse_attention_layer,
+            disable_index_value=disable_index_value,
+        )
+
         moe_layer_freq = getattr(config, "moe_layer_freq", None)
         self.is_moe_layer = (
             moe_layer_freq[layer_idx] != 0 if moe_layer_freq is not None else True
@@ -337,8 +607,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         else:
             self.mlp = MiniMaxM3MLP(config, intermediate_size=config.dense_intermediate_size)
 
-        self.input_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
+        norm_cls = _get_norm_class(self.use_gemma_norm)
+        self.input_layernorm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -457,6 +729,14 @@ def _patch_text_config(text_config):
     return text_config
 
 
+def _get_mtp_layer_indices(config):
+    """Return set of layer indices that belong to MTP (multi-token prediction) modules."""
+    num_mtp = getattr(config, "num_mtp_modules", 0)
+    if num_mtp <= 0:
+        return set()
+    return set(range(config.num_hidden_layers, config.num_hidden_layers + num_mtp))
+
+
 @auto_docstring
 class MiniMaxM3Model(MiniMaxM3PreTrainedModel):
     def __init__(self, config):
@@ -473,7 +753,9 @@ class MiniMaxM3Model(MiniMaxM3PreTrainedModel):
         self.layers = nn.ModuleList(
             [MiniMaxM3DecoderLayer(text_config, layer_idx) for layer_idx in range(text_config.num_hidden_layers)]
         )
-        self.norm = MiniMaxM3RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        use_gemma_norm = getattr(text_config, "use_gemma_norm", False)
+        norm_cls = _get_norm_class(use_gemma_norm)
+        self.norm = norm_cls(text_config.hidden_size, eps=text_config.rms_norm_eps)
         self.rotary_emb = MiniMaxM3RotaryEmbedding(config=text_config)
         self.gradient_checkpointing = False
 
