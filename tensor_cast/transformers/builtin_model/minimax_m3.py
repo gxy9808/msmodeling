@@ -6,7 +6,6 @@ from tensor_cast.transformers.transformations import (
     maybe_enable_mtp,
     patch_attention,
     patch_moe,
-    patch_rotary_emb,
     quantize_model,
     shard_model,
     wrap_model,
@@ -24,6 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 class MiniMaxM3ExpertMLP(torch.nn.Module):
+    """M3 Expert MLP using gate_proj + up_proj + down_proj with standard swiglu.
+
+    Forward uses silu(gate) * up (standard SwiGLU) instead of
+    SwigluOAIAndMul(cat([gate, up])), so that after quantization the DFC
+    (dispatch_ffn_combine) pass Case 2 can recognize:
+      static_quant_linear(gate) -> silu -> mul(up) -> static_quant_linear(down)
+    and fuse into a single dispatch_ffn_combine kernel.
+    """
+
     def __init__(self, original_experts_module, expert_idx=None):
         super().__init__()
         if isinstance(original_experts_module, torch.nn.ModuleList) and expert_idx is None:
@@ -34,19 +42,18 @@ class MiniMaxM3ExpertMLP(torch.nn.Module):
             expert = original_experts_module
         self.hidden_size = expert.hidden_size
         self.intermediate_size = expert.intermediate_size
-        self.act_fn = expert.act_fn
 
         self.gate_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = torch.nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
         with torch.no_grad():
-            self.gate_proj.weight.copy_(expert.gate_proj.weight)
-            self.up_proj.weight.copy_(expert.up_proj.weight)
-            self.down_proj.weight.copy_(expert.down_proj.weight)
+            self.gate_proj.weight.copy_(expert.gate_proj.weight.data)
+            self.up_proj.weight.copy_(expert.up_proj.weight.data)
+            self.down_proj.weight.copy_(expert.down_proj.weight.data)
 
     def forward(self, hidden_states):
-        return self.down_proj(self.act_fn(torch.cat([self.gate_proj(hidden_states), self.up_proj(hidden_states)], dim=-1)))
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
 class _MoeReturnCompat(torch.nn.Module):
