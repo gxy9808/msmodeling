@@ -421,22 +421,22 @@ class MiniMaxM3Attention(nn.Module):
         if self.qk_norm_type == "per_layer":
             orig_q_shape = query_states.shape
             orig_k_shape = key_states.shape
-            q_flat = query_states.reshape(-1, self.num_heads * self.head_dim).contiguous()
-            k_flat = key_states.reshape(-1, self.num_key_value_heads * self.head_dim).contiguous()
+            q_flat = query_states.contiguous().reshape(-1, self.num_heads * self.head_dim)
+            k_flat = key_states.contiguous().reshape(-1, self.num_key_value_heads * self.head_dim)
             q_normed = self.q_norm(q_flat).reshape(orig_q_shape)
             k_normed = self.k_norm(k_flat).reshape(orig_k_shape)
         elif self.qk_norm_type == "per_head":
             orig_q_shape = query_states.shape
             orig_k_shape = key_states.shape
-            q_flat = query_states.reshape(-1, self.head_dim).contiguous()
-            k_flat = key_states.reshape(-1, self.head_dim).contiguous()
+            q_flat = query_states.contiguous().reshape(-1, self.head_dim)
+            k_flat = key_states.contiguous().reshape(-1, self.head_dim)
             q_normed = self.q_norm(q_flat).reshape(orig_q_shape)
             k_normed = self.k_norm(k_flat).reshape(orig_k_shape)
         elif self.qk_norm_type == "multi_head":
             orig_q_shape = query_states.shape
             orig_k_shape = key_states.shape
-            q_flat = query_states.reshape(-1, self.num_heads * self.head_dim).contiguous()
-            k_flat = key_states.reshape(-1, self.num_key_value_heads * self.head_dim).contiguous()
+            q_flat = query_states.contiguous().reshape(-1, self.num_heads * self.head_dim)
+            k_flat = key_states.contiguous().reshape(-1, self.num_key_value_heads * self.head_dim)
             q_normed = self.q_norm(q_flat).reshape(orig_q_shape)
             k_normed = self.k_norm(k_flat).reshape(orig_k_shape)
         else:
@@ -446,8 +446,8 @@ class MiniMaxM3Attention(nn.Module):
     def _index_qk_norm(self, idx_q, idx_k):
         idx_q_shape = idx_q.shape
         idx_k_shape = idx_k.shape
-        idx_q = self.index_q_norm(idx_q.reshape(-1, self.idx_head_dim)).reshape(idx_q_shape)
-        idx_k = self.index_k_norm(idx_k.reshape(-1, self.idx_head_dim)).reshape(idx_k_shape)
+        idx_q = self.index_q_norm(idx_q.contiguous().reshape(-1, self.idx_head_dim)).reshape(idx_q_shape)
+        idx_k = self.index_k_norm(idx_k.contiguous().reshape(-1, self.idx_head_dim)).reshape(idx_k_shape)
         return idx_q, idx_k
 
     def _sparse_index_forward(self, hidden_states, cos, sin, input_shape):

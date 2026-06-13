@@ -2304,6 +2304,31 @@ def _(
     return properties
 
 
+def _safe_tensor_int_list(values, fallback_total: int | None = None) -> list[int]:
+    """Return concrete integer values, or a conservative compile-time fallback.
+
+    During torch.compile, multistream scheduling estimates custom op costs with
+    FakeTensors. Calling ``tolist()`` on those tensors can recurse through fake
+    dispatch indefinitely, so cost formulas must not require their real values.
+    """
+    if isinstance(values, torch.Tensor):
+        size = int(values.shape[0]) if values.dim() > 0 else 1
+        if getattr(values, "fake_mode", None) is not None or values.device.type == "meta":
+            if fallback_total is None:
+                return [1] * size
+            base = int(fallback_total) // max(size, 1)
+            rem = int(fallback_total) % max(size, 1)
+            return [base + (i < rem) for i in range(size)]
+        try:
+            return [int(v) for v in values.detach().cpu().tolist()]
+        except Exception:
+            if fallback_total is None:
+                return [1] * size
+            base = int(fallback_total) // max(size, 1)
+            rem = int(fallback_total) % max(size, 1)
+            return [base + (i < rem) for i in range(size)]
+    return [int(v) for v in values]
+
 
 def _estimate_minimax_indexer_breakdown(
     hidden_states: torch.Tensor,
@@ -2321,7 +2346,7 @@ def _estimate_minimax_indexer_breakdown(
     Formula reference: M3-msmodeling.md section 4.1.
     Variable naming: N = num_indexer_heads, D = indexer_head_dim, D_r = indexer_rope_dim.
     """
-    T = hidden_states.shape[0]
+    T = math.prod(hidden_states.shape[:-1])
     H = hidden_size
     N = num_indexer_heads
     D = indexer_head_dim
@@ -2338,8 +2363,8 @@ def _estimate_minimax_indexer_breakdown(
 
     # 4.1.4 Index Block Score (QK^T scoring)
     # sum_b(Q_b * N * L_b * D) * 2
-    Q_b_list = query_lens.tolist()
-    L_b_list = seq_lens.tolist()
+    Q_b_list = _safe_tensor_int_list(query_lens, fallback_total=T)
+    L_b_list = _safe_tensor_int_list(seq_lens, fallback_total=T)
     index_qk_mma = 0
     sum_qb_nb_lb = 0
     sum_qb_nb_bn = 0
@@ -2407,7 +2432,7 @@ def _estimate_minimax_sparse_attention_breakdown(
 
     Formula reference: M3-msmodeling.md section 4.2.
     """
-    T = query.shape[0]
+    T = math.prod(query.shape[:-1])
     N_q = num_q_heads
     N_kv = num_kv_heads
     D = head_dim
@@ -2417,8 +2442,8 @@ def _estimate_minimax_sparse_attention_breakdown(
 
     s = query.element_size()
 
-    Q_b_list = query_lens.tolist()
-    L_b_list = seq_lens.tolist()
+    Q_b_list = _safe_tensor_int_list(query_lens, fallback_total=T)
+    L_b_list = _safe_tensor_int_list(seq_lens, fallback_total=T)
 
     mma_total = 0
     gp_total = 0
