@@ -3,6 +3,7 @@ import logging
 import torch
 from tensor_cast.transformers.transformations import (
     maybe_enable_mtp,
+    maybe_reuse_layers,
     patch_attention,
     patch_moe,
     quantize_model,
@@ -88,6 +89,8 @@ def _patch_m3_moe_return_compat(model):
         else:
             return model
     for layer in unwrapped.layers:
+        while hasattr(layer, "_inner"):
+            layer = layer._inner
         block_sparse_moe = getattr(layer, "block_sparse_moe", None)
         if block_sparse_moe is not None and not isinstance(block_sparse_moe, _MoeReturnCompat):
             layer.block_sparse_moe = _MoeReturnCompat(block_sparse_moe)
@@ -176,6 +179,7 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
 def _(model: TransformerModel):
     model = wrap_model(model)
     model = maybe_enable_mtp(model)
+    model = maybe_reuse_layers(model)
     model = patch_minimax_m3_attention(model)
     model = patch_attention(model)
     model = patch_moe(model)
