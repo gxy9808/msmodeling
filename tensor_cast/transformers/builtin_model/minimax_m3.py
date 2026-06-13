@@ -165,10 +165,7 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
 
     def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
         gate, up = gate_up.chunk(2, dim=-1)
-        gate = gate.clamp(max=self.swiglu_limit)
-        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        glu = gate * torch.sigmoid(gate * self.swiglu_alpha)
-        return (up + 1.0) * glu
+        return torch.ops.tensor_cast.m3_swiglu(gate, up, self.swiglu_alpha, self.swiglu_limit)
 
     def _run_routed_experts(self, dispatched_hidden_states: list[torch.Tensor]) -> list[torch.Tensor]:
         gate_up = self._grouped_matmul(dispatched_hidden_states, self._gate_up_weights, self._gate_up_scales)

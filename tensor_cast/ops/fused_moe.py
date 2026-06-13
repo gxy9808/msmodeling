@@ -114,6 +114,76 @@ def _(
     return torch.empty((*expert_indices.shape, hidden_size), dtype=x.dtype, device=x.device)
 
 
+@register_tensor_cast_op("dispatch_ffn_combine_m3")
+def _(
+    x: torch.Tensor,
+    expert_indices: torch.Tensor,
+    gmm1_w: List[torch.Tensor],
+    gmm1_bias: List[Optional[torch.Tensor]],
+    gmm2_w: List[torch.Tensor],
+    gmm2_bias: List[Optional[torch.Tensor]],
+    alpha: float,
+    limit: float,
+    rank: int,
+    rank_group: List[int],
+) -> torch.Tensor:
+    """Fused MoE FFN for MiniMax-M3: routing + gate_up_proj(M3 SwiGLU) + down_proj.
+    BF16 variant with M3-specific SwiGLU (alpha scaling + clamp + up residual).
+    """
+    hidden_size = x.shape[-1]
+    return torch.empty((*expert_indices.shape, hidden_size), dtype=x.dtype, device=x.device)
+
+
+@register_tensor_cast_op("dispatch_ffn_combine_quant_m3")
+@register_tensor_cast_op("dispatch_ffn_combine_quant_int4_m3")
+def _(
+    x: torch.Tensor,
+    expert_indices: torch.Tensor,
+    gmm1_w: List[torch.Tensor],
+    gmm1_w_scale: List[torch.Tensor],
+    gmm1_w_offset: List[Optional[torch.Tensor]],
+    gmm1_bias: List[Optional[torch.Tensor]],
+    gmm1_out_dtype: Optional[torch.dtype],
+    gmm2_w: List[torch.Tensor],
+    gmm2_w_scale: List[torch.Tensor],
+    gmm2_w_offset: List[Optional[torch.Tensor]],
+    gmm2_bias: List[Optional[torch.Tensor]],
+    gmm2_out_dtype: Optional[torch.dtype],
+    alpha: float,
+    limit: float,
+    rank: int,
+    rank_group: List[int],
+) -> torch.Tensor:
+    """Fused MoE FFN for MiniMax-M3: W8A8/W4A8 quant variant."""
+    hidden_size = x.shape[-1]
+    return torch.empty((*expert_indices.shape, hidden_size), dtype=x.dtype, device=x.device)
+
+
+@register_tensor_cast_op("dispatch_ffn_combine_fp8_m3")
+@register_tensor_cast_op("dispatch_ffn_combine_mxfp4_m3")
+def _(
+    x: torch.Tensor,
+    expert_indices: torch.Tensor,
+    gmm1_w: List[torch.Tensor],
+    gmm1_w_scale: List[torch.Tensor],
+    gmm1_x_scale: List[torch.Tensor],
+    gmm1_bias: List[Optional[torch.Tensor]],
+    gmm1_out_dtype: Optional[torch.dtype],
+    gmm2_w: List[torch.Tensor],
+    gmm2_w_scale: List[torch.Tensor],
+    gmm2_x_scale: List[torch.Tensor],
+    gmm2_bias: List[Optional[torch.Tensor]],
+    gmm2_out_dtype: Optional[torch.dtype],
+    alpha: float,
+    limit: float,
+    rank: int,
+    rank_group: List[int],
+) -> torch.Tensor:
+    """Fused MoE FFN for MiniMax-M3: FP8/MXFP4 quant variant."""
+    hidden_size = x.shape[-1]
+    return torch.empty((*expert_indices.shape, hidden_size), dtype=x.dtype, device=x.device)
+
+
 @register_tensor_cast_op("moe_gating_top_k_softmax")
 def _(x: torch.Tensor, top_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -134,7 +204,7 @@ def _(x: torch.Tensor, top_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
             - topk_weights (torch.Tensor): Corresponding normalized weights (e.g., after softmax),
               with shape `(*x.shape[:-1], top_k)`, dtype and device as input `x`.
             - topk_indices (torch.Tensor): Indices of the selected experts,
-              with shape `(*x.shape[:-1], top_k)` and device as input `x`, dtype int64.
+              with shape `(*x.shape[:-1], top_k)` and dtype int64, device as input `x`.
     """
     out_shape = (*x.shape[:-1], top_k)
     return (
