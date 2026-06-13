@@ -12,6 +12,26 @@
 
 ## 2. 思路方案
 
+### 2.0 背景与问题演进
+
+MiniMax-M3 的最初适配路径是将 `docs/modeling_minimax.py` 放入权重目录，通过 `trust_remote_code=True` 让 Transformers 加载本地 modeling。这个方式可以快速验证模型结构，但长期存在三个问题：
+
+1. 本地 modeling 文件容易和上游 Transformers 实现漂移，后续维护成本高；
+2. `AutoModel.from_config()` 在 `auto_map` / remote code 场景下需要额外处理 `trust_remote_code`，否则模型加载会在交互式确认后仍然失败；
+3. 本地 modeling 放在 `docs/` 或权重目录中不属于 TensorCast 正式适配边界，不适合作为 PR 交付内容。
+
+在 `huggingface/transformers#46600` 合入 MiniMax-M3 后，适配目标切换为：**完全使用 upstream Transformers 的 native MiniMax-M3 modeling，不再依赖仓内自写 modeling 文件**。因此本轮修改的重点从“补一个临时 modeling”调整为“让 TensorCast 能识别、patch、量化、分片并建模 upstream M3 结构”。
+
+实际调试中还暴露出几个与 M3 结构相关的问题：
+
+- **Sparse Attention 边界不同于普通 attention**：M3 sparse layer 不是完整 dense attention，而是先用 indexer 选择 block，再执行 sparse QK/PV，需要拆成独立虚拟 op 建模。
+- **M3 expert 参数是 3D expert tensor**：upstream M3 的 routed expert 使用 `gate_up_proj` / `down_proj` 这类 `[E, *, *]` 权重，不是 TensorCast 原有 DFC 路线里每个 expert 一个 `gate_proj/up_proj/down_proj` module 的形态，因此无法自然融合成 TensorCast grouped matmul。
+- **VL 模型层路径影响层复用**：M3 是 Vision-Language 模型，但本次文本仿真不编译 visual layers。原有 VL 层复用逻辑只有在能拿到 visual layers 时才继续处理 language layers，导致 M3 的 60 层完整展开，compile 时间很长。
+- **完整 60 层 graph 暴露 multistream pass 递归栈风险**：即使层复用修复后 M3 常规路径不再强依赖该修复，`multistream_pass` 的 upward rank 本质是 DAG 上的反向动态规划，递归 DFS 对长图不够稳健。
+- **MXFP8 权重显存估算偏大**：直接按 live tensor 或 safetensors 存储大小估算，会把 M3 3D expert / scale 的存储结构算偏，需要模型特定估算逻辑。
+
+因此最终适配采用“native Transformers modeling + TensorCast profile/patch + M3 专属虚拟 op + M3 expert grouped matmul 转换 + 层复用修正 + 编译 pass 稳定性修正”的方案。
+
 ### 2.1 四层架构
 
 msmodeling 的性能建模采用"一算子一建模"四层架构：
@@ -43,6 +63,46 @@ Dense layer（前3层）复用已有 `tensor_cast.attention` 算子，无需新�
 - **虚拟算子层**：参考 `ops/attention.py` 和 `ops/mla.py`
 - **性能模型层**：参考 `_estimate_dsa_indexer_breakdown`（DeepSeek DSA Indexer 的拆解模式）
 
+### 2.4 本轮最终修改范围
+
+本轮整合后的代码改动可以分为七类：
+
+1. **模型加载与配置解析**
+   - 使用 upstream Transformers native MiniMax-M3 modeling；
+   - `AutoModelConfigLoader` 在 `auto_map` 只有 `AutoConfig` 时仍视为 native supported，只有存在 `AutoModel*` remote mapping 时才切到 remote code；
+   - `ConfigResolver` 从 HF config / text_config 解析 `dtype` / `torch_dtype`，避免初始化和执行 dtype 不一致。
+
+2. **MiniMax-M3 ModelProfile 与 patch 链**
+   - 注册 `model_type="minimax_m3_vl"`；
+   - 设置语言层路径为 `language_model.layers`；
+   - 构造空 `visual_layers` 容器，让 VL 模型也能触发 language layer reuse；
+   - patch 顺序调整为 `wrap_model -> maybe_enable_mtp -> maybe_reuse_layers -> patch_minimax_m3_attention -> patch_attention -> patch_moe -> quantize_model -> shard_model`。
+
+3. **Sparse Attention 虚拟 op**
+   - 新增 `minimax_indexer`：覆盖 index Q/K projection、norm、RoPE、index K cache write、block score、top-k；
+   - 新增 `minimax_sparse_attention`：覆盖 selected KV cache 读取、sparse QK/PV、输出 O；
+   - 性能模型层分别为两个 op 注册 MMA、GP、Bytes 估算。
+
+4. **MoE expert grouped matmul**
+   - 保留 upstream M3 的 3D expert 权重形态；
+   - 将 `[E, *, *]` expert 权重转成 TensorCast `grouped_matmul_fp8` 接受的 per-expert weight list；
+   - 复用 TensorCast 现有 `dynamic_quantize_symmetric` 和 `grouped_matmul_fp8` op；
+   - 保留 M3 的 `routed_scaling_factor`、`swiglu_alpha`、`swiglu_limit`。
+
+5. **权重大小估算**
+   - 为 `ModelProfile` 增加可选 `weight_size_estimator`；
+   - M3 MXFP8 下对 3D expert weight 按 weight element + scale block 估算；
+   - 避免模型加载后 live parameter dtype/shape 与真实 MXFP8 存储不一致导致显存偏大。
+
+6. **编译稳定性**
+   - `multistream_pass` upward rank 从递归 DFS 改为反向迭代 DP；
+   - 增加 Gemma-style `add_rms_norm` / `add_rms_norm2` / quant pattern，避免 M3 RMSNorm residual fusion 路径需要通过关闭 fusion 规避。
+
+7. **设备与测试**
+   - 新增 B200 device profile；
+   - 新增 MiniMax-M3 op 注册与 meta shape 回归测试；
+   - 删除临时 `docs/modeling_minimax.py`，避免继续依赖自写 Transformers modeling。
+
 ---
 
 ## 3. 代码修改详情
@@ -56,6 +116,14 @@ Dense layer（前3层）复用已有 `tensor_cast.attention` 算子，无需新�
 | 抽象算子层 | `tensor_cast/layers/minimax_m3_attention.py` | **新建** | `MiniMaxM3AttentionWrapper`：dense 走标准 attention，sparse 调用 indexer + sparse_attention |
 | 模型定义层 | `tensor_cast/transformers/builtin_model/minimax_m3.py` | **新建** | 注册 `minimax_m3_vl` 的 ModelProfile + `@register_custom_model`，含 `patch_minimax_m3_attention` |
 | 性能模型层 | `tensor_cast/performance_model/__init__.py` | **修改** | 追加 `_estimate_minimax_indexer_breakdown` 和 `_estimate_minimax_sparse_attention_breakdown`，注册 `@register_op_properties` |
+| 模型加载 | `tensor_cast/transformers/utils.py` | **修改** | 修正 native Transformers / remote code 判断，支持 upstream M3 modeling |
+| 配置解析 | `tensor_cast/core/config_resolver.py` | **修改** | 从 HF config / text_config 继承 dtype |
+| 层复用 | `tensor_cast/transformers/builtin_model/minimax_m3.py` | **修改** | 为 M3 构造空 visual layers，使 VL language layers reuse 生效 |
+| MoE grouped matmul | `tensor_cast/transformers/builtin_model/minimax_m3.py`、`tensor_cast/layers/moe_layer.py` | **修改** | 将 M3 3D expert 转换为 TensorCast grouped matmul 输入，并保留 M3 MoE 属性 |
+| 编译稳定性 | `tensor_cast/compilation/passes/multistream_pass.py` | **修改** | upward rank 从递归 DFS 改为反向迭代 DP |
+| RMSNorm fusion | `tensor_cast/compilation/patterns/rms_norm.py` | **修改** | 增加 Gemma-style add-rms-norm fusion pattern |
+| 权重大小估算 | `tensor_cast/transformers/custom_model_registry.py`、`tensor_cast/transformers/model.py`、`minimax_m3.py` | **修改** | 增加可选模型级 weight size estimator，并为 M3 MXFP8 实现估算 |
+| 设备 profile | `tensor_cast/device_profiles/b200.py` | **新建** | 增加 B200 profile |
 | 测试 | `tests/regression/tensor_cast/test_minimax_m3.py` | **新建** | op 注册 + meta shape 验证 |
 
 ### 3.2 虚拟算子层：`tensor_cast/ops/minimax_m3_sparse_attention.py`（新建）
@@ -537,6 +605,133 @@ def _(op_invoke_info: OpInvokeInfo) -> OpInvokeInfo.PerformanceProperties:
 - `minimax_sparse_attention` 排除 KV cache 的自动访存统计（`exclude_input_ids={1, 2}`），因为 KV cache 的访存由拆解函数按 selected blocks 精确计算
 - `minimax_indexer` 使用默认的自动访存 + 额外 `memory_readwrite_bytes`，因为 indexer 的 index K cache 访存需要精确建模
 
+### 3.7 其他关键修复
+
+#### 3.7.1 切换到 upstream Transformers native modeling
+
+早期验证阶段使用 `docs/modeling_minimax.py` 作为自定义 Transformers modeling，并复制到权重目录注册 AutoModel。这条路径的问题是：模型定义不再跟随 upstream Transformers 演进，而且 `AutoConfig` / `AutoModel` 在 remote code 判断上容易进入 `trust_remote_code` 分支。
+
+最终实现删除了临时 modeling 文件，改为依赖 upstream Transformers 中的 `minimax_m3_vl` 实现。为此做了两处基础修改：
+
+- `tensor_cast/transformers/utils.py`：加载 config 后检查 `auto_map`。如果 `auto_map` 只包含 `AutoConfig`，仍认为 Transformers native supported；只有出现 `AutoModel*` 映射时才视为需要 remote code。
+- `tensor_cast/core/config_resolver.py`：从 HF config 或 text_config 读取 `dtype` / `torch_dtype`，写入 `ModelConfig.dtype`，避免 native M3 初始化时 dtype 和执行路径不一致。
+
+这样 M3 的加载边界变为：
+
+```
+MiniMax-M3-MXFP8/config.json
+    -> upstream transformers.models.minimax_m3_vl
+    -> TensorCast ModelProfile("minimax_m3_vl")
+    -> TensorCast custom patch
+```
+
+#### 3.7.2 语言层复用
+
+MiniMax-M3 是 VL 模型，但本轮仿真主要面向语言模型路径，不编译 visual encoder。原有 `maybe_reuse_layers` 对 VL 模型的 language layers 复用依赖 `get_visual_layers(model)` 返回非空；M3 没有进入这条路径时，60 层 decoder 会完整展开，导致 compile 时间很长。
+
+本轮修改在 `minimax_m3.py` 中新增 `_ensure_empty_visual_layers_for_reuse()`：
+
+```python
+_EMPTY_VISUAL_LAYERS_ATTR = "_tensor_cast_empty_visual_layers"
+
+def _ensure_empty_visual_layers_for_reuse(model: TransformerModel):
+    unwrapped = model.unwrap()
+    if not hasattr(unwrapped, _EMPTY_VISUAL_LAYERS_ATTR):
+        setattr(unwrapped, _EMPTY_VISUAL_LAYERS_ATTR, torch.nn.ModuleList())
+```
+
+同时在 `ModelProfile` 中设置：
+
+```python
+visual_layers_module_path=_EMPTY_VISUAL_LAYERS_ATTR
+visual_layers_path_str=_EMPTY_VISUAL_LAYERS_ATTR
+language_layers_path_str="language_model.layers"
+language_module_path="language_model"
+```
+
+这样 `maybe_reuse_layers` 能继续处理 language layers。实际效果是 M3 language layers 被压缩为两个代表 region：dense/full layer 代表组和 sparse/MoE layer 代表组，其余层通过 `CopyLayerWrapper` 表示重复区域，避免 60 层真实 graph 全量进入 compile。
+
+#### 3.7.3 M3 3D expert 转 TensorCast grouped matmul
+
+upstream M3 routed expert 的权重不是每个 expert 一个子 module，而是集中存储为 3D tensor：
+
+```
+experts.gate_up_proj: [E, 2I, H]
+experts.down_proj:    [E, H, I]
+```
+
+TensorCast 原有 DFC / grouped matmul 路线更适合 per-expert weight list。为了复用现有 `dynamic_quantize_symmetric` 和 `grouped_matmul_fp8`，新增 `MiniMaxM3FusedMoETensorCast`：
+
+- 将 3D expert weight 按 expert 维拆成 list；
+- 对每个 expert weight 做 transpose，使其匹配 grouped matmul 的输入格式；
+- gate_up 和 down 分别调用一次 `tensor_cast.grouped_matmul_fp8`；
+- gate_up 输出使用 M3 的 SwiGLU 变体：
+
+```python
+gate, up = gate_up.chunk(2, dim=-1)
+gate = gate.clamp(max=self.swiglu_limit)
+up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+glu = gate * torch.sigmoid(gate * self.swiglu_alpha)
+activated = (up + 1.0) * glu
+```
+
+`ParallelMoELayer` 也做了通用修复：并行包装时不再强制重建成基础 `FusedMoETensorCast`，而是保留原 fused moe 的具体类型，并复制 `routed_scaling_factor`、`swiglu_alpha`、`swiglu_limit`、`quant_type` 等属性。
+
+#### 3.7.4 MXFP8 权重大小估算
+
+M3 MXFP8 expert 权重的真实存储不是简单的 BF16/FP8 dense tensor 大小。直接按模型加载后的 live tensor 或 safetensors 文件大小估算，会把 expert weight 和 scale 的关系算偏，出现模型权重大小显著大于预期的问题。
+
+本轮为 `ModelProfile` 增加可选字段：
+
+```python
+weight_size_estimator: Optional[Callable] = None
+```
+
+`TransformerModel.weight_size` 优先调用模型 profile 提供的 estimator。M3 的 estimator 对 3D expert 权重按：
+
+```
+weight bytes = number_of_weight_elements
+scale bytes  = number_of_scale_blocks
+```
+
+估算，其中 scale block 只覆盖最后两个维度，expert 维度作为 batch 维处理。非 3D expert 参数仍使用通用 `bytes_of_tensor()`。
+
+#### 3.7.5 multistream upward rank 迭代 DP
+
+在层复用修复前，M3 60 层完整展开会让 FX graph 的依赖链很长，`multistream_pass` 中 upward rank 的递归 DFS 可能触发 Python recursion limit。即使 M3 现在通过层复用绕开了主要压力，这个问题仍属于通用 compile pass 的脆弱点：
+
+- 用户可以关闭层复用；
+- 其他模型也可能生成很长的 FX graph；
+- 某些模型结构不完全同构，无法稳定命中 reuse；
+- upward rank 本质是 DAG 上的反向动态规划，不需要递归实现。
+
+因此将 `_compute_upward_ranks()` 从递归 DFS 改为按拓扑序反向遍历：
+
+```python
+for node in reversed(nodes):
+    self_cost = min(self._estimate_node_cost_s(node, stream_id) for stream_id in self._allowed_streams(node))
+    max_succ_rank = 0.0
+    for user in node.users.keys():
+        if user in schedulable and user in self._ranks:
+            max_succ_rank = max(max_succ_rank, self._ranks[user] + self.cross_stream_sync_overhead_s)
+    self._ranks[node] = self_cost + max_succ_rank
+```
+
+当前实现依赖传入的 `nodes` 是 FX 拓扑序；FX graph 通常满足这一点。若未来该 pass 支持非拓扑输入，需要在进入该函数前显式 topo sort。
+
+#### 3.7.6 Gemma-style Add RMSNorm fusion
+
+M3 的 RMSNorm residual 路径更接近 Gemma 风格，即 norm weight 在计算时使用 `1.0 + weight`。早期规避方式是对 MiniMax-M3 定向关闭 add-rms-norm residual fusion，但这会降低编译优化覆盖面。
+
+本轮在 `tensor_cast/compilation/patterns/rms_norm.py` 中增加 Gemma-style pattern：
+
+- `GemmaAddRMSNormPattern`
+- `GemmaAddRMSNorm2Pattern`
+- `GemmaAddRMSNormQuantPattern`
+- `GemmaAddRMSNormQuant2Pattern`
+
+这些 pattern 在匹配时显式构造 `effective_weight = 1.0 + weight`，再替换为 TensorCast fused RMSNorm op，避免为了 M3 单独关闭 fusion。
+
 ---
 
 ## 4. 测试验证
@@ -686,12 +881,16 @@ print(profile.language_layers_path_str)  # language_model.model.layers
 
 ```bash
 python -m cli.inference.text_generate \
-    --model-id minimax/MiniMax-M3 \
-    --num-queries 1 \
-    --query-length 128 \
-    --decode \
-    --tp-size 8 \
-    --device ATLAS_800_A3_752T_128G_DIE
+  /Users/liujiaxu/Code/MiniMax-M3-MXFP8 \
+  --num-queries 1 \
+  --query-length 64 \
+  --decode \
+  --num-devices 8 \
+  --tp-size 8 \
+  --ep-size 8 \
+  --quantize-linear-action FP8 \
+  --log-level info \
+  --compile
 ```
 
 ### 5.2 注册流程追溯
@@ -747,6 +946,8 @@ Runtime.__torch_dispatch__()
 ## 6. 后续工作
 
 1. **端到端对比验证**：在 B200/A5 上采集硬件实测 TTFT/TPOT，与 msmodeling 仿真结果做误差对比
-2. **Index value/output 分支**：当 `sparse_disable_index_value=False` 的 sparse layer 出现时，需要额外建模 `index_v_proj` / `index_o_proj` 分支
-3. **SwiGLU 变体**：M3 使用 `swigluoai`（带 alpha/limit 参数），可能需要定制 SwiGLU op 的 GP 估算
-4. **Profiling 校正**：通过实际 kernel profiling 数据校正访存量的 lower/upper bound
+2. **EP + shared expert TP**：当前 TP8 路径已验证；EP8 + shared expert TP 仍需补齐 `moe_route_after_dp_transform=True` 和 `shared_experts.gate_up_proj` 的 colwise TP 规则
+3. **MXFP8 scale 接入**：当前 M3 grouped matmul FP8 路径复用 TensorCast op，但 expert weight scale 仍是占位 scale，需要接入真实 MXFP8 scale
+4. **Sparse op 通信建模**：`minimax_indexer` 和 `minimax_sparse_attention` 当前只建模计算和访存，若后续 kernel 实现包含 TP/EP 通信，需要拆出或在性能模型中补充通信项
+5. **测试覆盖扩展**：现有回归测试只覆盖 op 注册和 meta shape，需要补充 TP1/TP8 compile、EP8、shared expert TP、op count 和 weight size 的回归测试
+6. **Profiling 校正**：通过实际 kernel profiling 数据校正 indexer、sparse attention、grouped matmul 的访存量和 lower/upper bound
