@@ -1,6 +1,10 @@
 import logging
+import math
 
 import torch
+from tensor_cast.layers.moe_layer import FusedMoETensorCast, MoELayer
+from tensor_cast.performance_model.utils import bytes_of_tensor
+from tensor_cast.quantize_utils import LinearQuantType
 from tensor_cast.transformers.transformations import (
     maybe_enable_mtp,
     maybe_reuse_layers,
@@ -10,6 +14,7 @@ from tensor_cast.transformers.transformations import (
     shard_model,
     wrap_model,
 )
+from tensor_cast.utils import DTYPE_FP8
 
 from ..custom_model_registry import (
     ModelProfile,
@@ -20,6 +25,8 @@ from ..model import TransformerModel
 from ...layers.minimax_m3_attention import MiniMaxM3AttentionWrapper
 
 logger = logging.getLogger(__name__)
+
+_EMPTY_VISUAL_LAYERS_ATTR = "_tensor_cast_empty_visual_layers"
 
 
 class MiniMaxM3ExpertMLP(torch.nn.Module):
@@ -68,6 +75,146 @@ class _MoeReturnCompat(torch.nn.Module):
         return result, None
 
 
+class MiniMaxM3MoELayer(MoELayer):
+    def __init__(self, moe_config, module, quant_type):
+        super().__init__(moe_config, module)
+        self.fused_moe = MiniMaxM3FusedMoETensorCast(
+            self.moe_config,
+            self.get_attr(module, "experts", None),
+            self.get_attr(module, "shared_experts", None),
+            self.get_attr(module, "shared_experts_gate", None),
+            self.top_k,
+        )
+        self.fused_moe.routed_scaling_factor = module.routed_scaling_factor
+        self.fused_moe.swiglu_alpha = module.experts.swiglu_alpha
+        self.fused_moe.swiglu_limit = module.experts.swiglu_limit
+        self.fused_moe.quant_type = quant_type
+        self.fused_moe.refresh_expert_weight_cache()
+
+
+class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
+    routed_scaling_factor = 1.0
+    swiglu_alpha = 1.0
+    swiglu_limit = 1.0
+    quant_type = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._gate_up_weights = None
+        self._gate_up_scales = None
+        self._down_weights = None
+        self._down_scales = None
+
+    @staticmethod
+    def _transpose_expert_weights(weight: torch.Tensor) -> list[torch.Tensor]:
+        return [weight[i].transpose(0, 1).contiguous() for i in range(weight.shape[0])]
+
+    @staticmethod
+    def _bias_list(count: int) -> list[None]:
+        return [None] * count
+
+    @staticmethod
+    def _scale_list(weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [torch.ones((), device=weight.device, dtype=torch.float32) for weight in weights]
+
+    @staticmethod
+    def _split_by_inputs(tensor: torch.Tensor, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+        return list(torch.split(tensor, [x.shape[0] for x in inputs], dim=0))
+
+    def refresh_expert_weight_cache(self):
+        experts = self.experts.experts
+        self._gate_up_weights = self._transpose_expert_weights(experts.gate_up_proj)
+        self._down_weights = self._transpose_expert_weights(experts.down_proj)
+        if self.quant_type == LinearQuantType.FP8:
+            self._gate_up_weights = [weight.to(DTYPE_FP8) for weight in self._gate_up_weights]
+            self._down_weights = [weight.to(DTYPE_FP8) for weight in self._down_weights]
+            self._gate_up_scales = self._scale_list(self._gate_up_weights)
+            self._down_scales = self._scale_list(self._down_weights)
+        else:
+            self._gate_up_scales = None
+            self._down_scales = None
+
+    def _grouped_matmul(
+        self,
+        x: list[torch.Tensor],
+        weights: list[torch.Tensor],
+        weight_scales: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
+        bias = self._bias_list(len(weights))
+        if self.quant_type == LinearQuantType.FP8:
+            quantized_x = []
+            x_scale = []
+            for xi in x:
+                xi, scale = torch.ops.tensor_cast.dynamic_quantize_symmetric(
+                    xi,
+                    dims=[-1],
+                    scale_dtype=torch.float32,
+                    out_dtype=torch.int8,
+                )
+                quantized_x.append(xi)
+                x_scale.append(scale)
+            return torch.ops.tensor_cast.grouped_matmul_fp8(
+                quantized_x,
+                weights,
+                weight_scales,
+                x_scale,
+                bias,
+                out_dtype=x[0].dtype if x else torch.bfloat16,
+            )
+        return torch.ops.tensor_cast.grouped_matmul(x, weights, bias)
+
+    def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        glu = gate * torch.sigmoid(gate * self.swiglu_alpha)
+        return (up + 1.0) * glu
+
+    def _run_routed_experts(self, dispatched_hidden_states: list[torch.Tensor]) -> list[torch.Tensor]:
+        gate_up = self._grouped_matmul(dispatched_hidden_states, self._gate_up_weights, self._gate_up_scales)
+        activated = self._apply_gate(gate_up)
+        activated_by_expert = self._split_by_inputs(activated, dispatched_hidden_states)
+        down = self._grouped_matmul(activated_by_expert, self._down_weights, self._down_scales)
+        return self._split_by_inputs(down, dispatched_hidden_states)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        skip_shared_experts: bool = False,
+    ) -> torch.Tensor:
+        original_shape = hidden_states.shape
+        num_tokens = topk_indices.numel()
+        split_sizes = self.get_split_sizes(num_tokens, self.top_k)
+
+        expert_indices = topk_indices
+        expert_weights = topk_weights
+        dispatched_hidden_states = self.dispatch_tokens(
+            hidden_states,
+            expert_indices,
+            split_sizes[0],
+            split_sizes[1],
+            split_sizes[3],
+        )
+
+        experts_hidden_states = self._run_routed_experts(dispatched_hidden_states)
+        combined_hidden_states = self.combine_tokens(
+            experts_hidden_states,
+            expert_indices,
+            split_sizes[0],
+            split_sizes[1],
+            split_sizes[3],
+        )
+        final_hidden_states = (combined_hidden_states * expert_weights.unsqueeze(-1)).sum(dim=-2)
+        final_hidden_states = final_hidden_states * self.routed_scaling_factor
+
+        final_hidden_states = final_hidden_states.view(original_shape)
+        if self.shared_experts and self.num_external_shared_experts == 0 and not skip_shared_experts:
+            final_hidden_states = final_hidden_states + self._run_shared_experts(hidden_states)
+        return final_hidden_states.to(hidden_states.dtype)
+
+
 def _patch_minimax_m3_hf_config(hf_config, model_id):
     if hasattr(hf_config, "text_config") and not hasattr(hf_config, "num_hidden_layers"):
         tc = hf_config.text_config
@@ -97,12 +244,95 @@ def _patch_m3_moe_return_compat(model):
     return model
 
 
+def _ensure_empty_visual_layers_for_reuse(model: TransformerModel):
+    # MiniMax-M3 text layers live under model.language_model.layers, but the current VL reuse path only
+    # reaches language layers when visual layers are present. M3 simulations here do not compile visual
+    # layers, so provide an empty visual-layer container to trigger language-layer reuse.
+    unwrapped = model.unwrap()
+    if not hasattr(unwrapped, _EMPTY_VISUAL_LAYERS_ATTR):
+        setattr(unwrapped, _EMPTY_VISUAL_LAYERS_ATTR, torch.nn.ModuleList())
+
+
+def _get_quantization_config_value(config, key, default=None):
+    quantization_config = getattr(config, "quantization_config", None)
+    if quantization_config is None and hasattr(config, "text_config"):
+        quantization_config = getattr(config.text_config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        return quantization_config.get(key, default)
+    return getattr(quantization_config, key, default)
+
+
+def _is_mxfp8_config(config) -> bool:
+    quant_method = _get_quantization_config_value(config, "quant_method")
+    return quant_method == "mxfp8"
+
+
+def _get_weight_block_size(config):
+    block_size = _get_quantization_config_value(config, "weight_block_size", (1, 32))
+    return tuple(block_size)
+
+
+def _mxfp8_tensor_weight_size(tensor: torch.Tensor, weight_block_size) -> int:
+    # MiniMax-M3 MXFP8 expert weights are stored as one byte per weight element plus one byte per
+    # scale block. The expert dimension is a batch dimension, so blocks cover the last two dims.
+    rows_per_block, cols_per_block = weight_block_size
+    leading_numel = math.prod(tensor.shape[:-2]) if tensor.ndim > 2 else 1
+    out_dim, in_dim = tensor.shape[-2:]
+    num_scale_blocks = (
+        leading_numel
+        * math.ceil(out_dim / rows_per_block)
+        * math.ceil(in_dim / cols_per_block)
+    )
+    return tensor.numel() + num_scale_blocks
+
+
+def estimate_minimax_m3_weight_size(model: TransformerModel) -> int:
+    if not _is_mxfp8_config(model.hf_config):
+        return model.get_weight_size_nested([model])
+
+    weight_block_size = _get_weight_block_size(model.hf_config)
+    total_size = 0
+    for name, param in model.named_parameters():
+        if (
+            param.ndim == 3
+            and (
+                name.endswith(".gate_up_proj")
+                or name.endswith(".down_proj")
+            )
+        ):
+            total_size += _mxfp8_tensor_weight_size(param, weight_block_size)
+        else:
+            total_size += int(bytes_of_tensor(param))
+    for _, buffer in model.named_buffers():
+        total_size += int(bytes_of_tensor(buffer))
+    return total_size
+
+
 def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
     sparse_cfg = None
     text_config = model.text_config
 
     if hasattr(text_config, "sparse_attention_config"):
         sparse_cfg = text_config.sparse_attention_config
+    layer_types = getattr(text_config, "layer_types", None)
+    has_native_sparse_config = (
+        layer_types is not None
+        and any(layer_type == "minimax_m3_sparse" for layer_type in layer_types)
+        and hasattr(text_config, "index_n_heads")
+    )
+    if sparse_cfg is None and has_native_sparse_config:
+        sparse_cfg = {
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [
+                1 if layer_type == "minimax_m3_sparse" else 0
+                for layer_type in layer_types
+            ],
+            "sparse_num_index_heads": text_config.index_n_heads,
+            "sparse_index_dim": text_config.index_head_dim,
+            "sparse_topk_blocks": text_config.index_topk_blocks,
+            "sparse_block_size": text_config.index_block_size,
+            "sparse_local_block": text_config.index_local_blocks,
+        }
     if sparse_cfg is None or not sparse_cfg.get("use_sparse_attention", False):
         logger.info("No sparse_attention_config found, skipping M3 attention patch")
         return model
@@ -129,14 +359,22 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
 
     unwrapped = model.unwrap()
     if not hasattr(unwrapped, "layers"):
-        language_model = unwrapped
-        if hasattr(unwrapped, "language_model"):
-            language_model = unwrapped.language_model
-        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
-            unwrapped = language_model.model
+        candidates = [
+            getattr(unwrapped, "language_model", None),
+            getattr(getattr(unwrapped, "model", None), "language_model", None),
+            getattr(getattr(unwrapped, "language_model", None), "model", None),
+        ]
+        for candidate in candidates:
+            if candidate is not None and hasattr(candidate, "layers"):
+                unwrapped = candidate
+                break
         else:
-            logger.warning("Cannot find layers for M3 attention patch")
-            return model
+            model_attr = getattr(unwrapped, "model", None)
+            if hasattr(model_attr, "layers"):
+                unwrapped = model_attr
+            else:
+                logger.warning("Cannot find layers for M3 attention patch")
+                return model
 
     for layer_idx, layer in enumerate(unwrapped.layers):
         self_attn = layer
@@ -177,12 +415,22 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
 
 @register_custom_model("minimax_m3_vl")
 def _(model: TransformerModel):
+    linear_quant_configs = model.model_config.quant_config.linear_configs
+    quant_type = next(iter(linear_quant_configs.values())).quant_type if linear_quant_configs else None
     model = wrap_model(model)
     model = maybe_enable_mtp(model)
+    _ensure_empty_visual_layers_for_reuse(model)
     model = maybe_reuse_layers(model)
     model = patch_minimax_m3_attention(model)
     model = patch_attention(model)
-    model = patch_moe(model)
+    model = patch_moe(
+        model,
+        lambda moe_config, module: MiniMaxM3MoELayer(
+            moe_config,
+            module,
+            quant_type,
+        ),
+    )
     model = _patch_m3_moe_return_compat(model)
     model = quantize_model(model)
     model = shard_model(model)
@@ -192,16 +440,19 @@ def _(model: TransformerModel):
 register_model_profile(
     ModelProfile(
         model_type="minimax_m3_vl",
-        moe_module_name="MiniMaxM3SparseMoeBlock",
-        moe_gate_returns_raw_logits=True,
+        moe_module_name="MiniMaxM3VLSparseMoeBlock",
+        moe_gate_returns_raw_logits=False,
         moe_num_experts_key="num_local_experts",
         mtp_block_module_name="MiniMaxM3DecoderLayer",
         hf_config_patch_method=_patch_minimax_m3_hf_config,
-        language_layers_path_str="model.layers",
-        language_module_path="model",
+        weight_size_estimator=estimate_minimax_m3_weight_size,
+        language_layers_path_str="language_model.layers",
+        language_module_path="language_model",
+        visual_layers_module_path=_EMPTY_VISUAL_LAYERS_ATTR,
+        visual_layers_path_str=_EMPTY_VISUAL_LAYERS_ATTR,
         moe_field_names_override={
             "shared_experts": "shared_experts",
         },
-        custom_expert_module_type=MiniMaxM3ExpertMLP,
+        custom_expert_module_type=None,
     )
 )
