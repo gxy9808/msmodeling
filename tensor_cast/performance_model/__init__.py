@@ -2304,4 +2304,247 @@ def _(
     return properties
 
 
+def _safe_tensor_int_list(values, fallback_total: int | None = None) -> list[int]:
+    """Return concrete integer values, or a conservative compile-time fallback.
+
+    During torch.compile, multistream scheduling estimates custom op costs with
+    FakeTensors. Calling ``tolist()`` on those tensors can recurse through fake
+    dispatch indefinitely, so cost formulas must not require their real values.
+    """
+    if isinstance(values, torch.Tensor):
+        size = int(values.shape[0]) if values.dim() > 0 else 1
+        if getattr(values, "fake_mode", None) is not None or values.device.type == "meta":
+            if fallback_total is None:
+                return [1] * size
+            base = int(fallback_total) // max(size, 1)
+            rem = int(fallback_total) % max(size, 1)
+            return [base + (i < rem) for i in range(size)]
+        try:
+            return [int(v) for v in values.detach().cpu().tolist()]
+        except Exception:
+            if fallback_total is None:
+                return [1] * size
+            base = int(fallback_total) // max(size, 1)
+            rem = int(fallback_total) % max(size, 1)
+            return [base + (i < rem) for i in range(size)]
+    return [int(v) for v in values]
+
+
+def _estimate_minimax_indexer_breakdown(
+    hidden_states: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_lens: torch.Tensor,
+    hidden_size: int,
+    num_indexer_heads: int,
+    indexer_head_dim: int,
+    indexer_rope_dim: int,
+    topk_blocks: int,
+    block_size: int,
+):
+    """Estimate FLOPs and memory bytes for minimax_indexer.
+
+    Formula reference: M3-msmodeling.md section 4.1.
+    Variable naming: N = num_indexer_heads, D = indexer_head_dim, D_r = indexer_rope_dim.
+    """
+    T = math.prod(hidden_states.shape[:-1])
+    H = hidden_size
+    N = num_indexer_heads
+    D = indexer_head_dim
+    D_r = indexer_rope_dim
+    K = topk_blocks
+    B_s = block_size
+
+    s = hidden_states.element_size()
+
+    # --- MMA ---
+    # 4.1.1 Index Q/K Projection
+    index_q_proj_mma = 2 * T * H * N * D
+    index_k_proj_mma = 2 * T * H * N * D
+
+    # 4.1.4 Index Block Score (QK^T scoring)
+    # sum_b(Q_b * N * L_b * D) * 2
+    Q_b_list = _safe_tensor_int_list(query_lens, fallback_total=T)
+    L_b_list = _safe_tensor_int_list(seq_lens, fallback_total=T)
+    index_qk_mma = 0
+    sum_qb_nb_lb = 0
+    sum_qb_nb_bn = 0
+    for Q_b, L_b in zip(Q_b_list, L_b_list):
+        B_n = math.ceil(L_b / B_s) if B_s > 0 else 0
+        index_qk_mma += 2 * Q_b * N * L_b * D
+        sum_qb_nb_lb += Q_b * N * L_b
+        sum_qb_nb_bn += Q_b * N * B_n
+
+    # --- GP ---
+    # 4.1.2 Index Q/K Norm + RoPE
+    index_norm_gp = 12 * T * N * D
+    index_rope_gp = 6 * T * N * D_r
+
+    # 4.1.4 Block reduce (score_type = max)
+    block_reduce_gp = sum_qb_nb_lb
+
+    # 4.1.5 Top-k selection
+    c_topk = max(int(math.ceil(math.log2(max(K, 2)))), 1)
+    topk_gp = c_topk * sum_qb_nb_bn
+
+    # --- Bytes ---
+    # 4.1.1 Index Q/K Projection
+    bytes_projection = 2 * T * H * s + 2 * H * N * D * s + 2 * T * N * D * s
+
+    # 4.1.2 Index Q/K Norm + RoPE
+    bytes_norm_rope = 4 * T * N * D * s + 4 * T * N * D * s + 2 * N * D * s
+
+    # 4.1.3 Index K Cache Write
+    bytes_cache_write = 2 * T * N * D * s
+
+    # 4.1.4 Block Score
+    bytes_score = T * N * D * s
+    for Q_b, L_b in zip(Q_b_list, L_b_list):
+        B_n = math.ceil(L_b / B_s) if B_s > 0 else 0
+        bytes_score += Q_b * N * L_b * D * s
+        bytes_score += 4 * Q_b * N * B_n
+
+    # 4.1.5 Top-k Selection
+    bytes_topk = 4 * sum_qb_nb_bn + 4 * T * N * K
+
+    mma_total = index_q_proj_mma + index_k_proj_mma + index_qk_mma
+    gp_total = index_norm_gp + index_rope_gp + block_reduce_gp + topk_gp
+    bytes_total = bytes_projection + bytes_norm_rope + bytes_cache_write + bytes_score + bytes_topk
+
+    return {
+        "mma_total": mma_total,
+        "gp_total": gp_total,
+        "bytes_total": bytes_total,
+    }
+
+
+def _estimate_minimax_sparse_attention_breakdown(
+    query: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_lens: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    topk_blocks: int,
+    block_size: int,
+    local_blocks: int,
+):
+    """Estimate FLOPs and memory bytes for minimax_sparse_attention.
+
+    Formula reference: M3-msmodeling.md section 4.2.
+    """
+    T = math.prod(query.shape[:-1])
+    N_q = num_q_heads
+    N_kv = num_kv_heads
+    D = head_dim
+    K = topk_blocks
+    B_s = block_size
+    R = local_blocks
+
+    s = query.element_size()
+
+    Q_b_list = _safe_tensor_int_list(query_lens, fallback_total=T)
+    L_b_list = _safe_tensor_int_list(seq_lens, fallback_total=T)
+
+    mma_total = 0
+    gp_total = 0
+    qo_bytes = 2 * s * T * N_q * D
+    kv_bytes = 0
+    topk_bytes = 4 * T * N_kv * K
+
+    for Q_b, L_b in zip(Q_b_list, L_b_list):
+        B_n = math.ceil(L_b / B_s) if B_s > 0 else 0
+        A_b = min(L_b, min(B_n, K + R) * B_s)
+
+        # MMA: QK^T + PV => 4 * Q_b * N_q * A_b * D
+        mma_total += 4 * Q_b * N_q * A_b * D
+
+        # GP: softmax ~6 ops per (Q_b * N_q * A_b)
+        gp_total += 6 * Q_b * N_q * A_b
+
+        # KV read: 2 * s * Q_b * A_b * N_kv * D
+        kv_bytes += 2 * s * Q_b * A_b * N_kv * D
+
+    bytes_total = qo_bytes + kv_bytes + topk_bytes
+
+    return {
+        "mma_total": mma_total,
+        "gp_total": gp_total,
+        "bytes_total": bytes_total,
+    }
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.minimax_indexer.default)
+def _(
+    op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    hidden_states = op_invoke_info.args[0]
+    seq_lens = op_invoke_info.args[1]
+    query_lens = op_invoke_info.args[2]
+    hidden_size = op_invoke_info.kwargs["hidden_size"]
+    num_indexer_heads = op_invoke_info.kwargs["num_indexer_heads"]
+    indexer_head_dim = op_invoke_info.kwargs["indexer_head_dim"]
+    indexer_rope_dim = op_invoke_info.kwargs["indexer_rope_dim"]
+    topk_blocks = op_invoke_info.kwargs["topk_blocks"]
+    block_size = op_invoke_info.kwargs["block_size"]
+
+    breakdown = _estimate_minimax_indexer_breakdown(
+        hidden_states,
+        seq_lens,
+        query_lens,
+        hidden_size,
+        num_indexer_heads,
+        indexer_head_dim,
+        indexer_rope_dim,
+        topk_blocks,
+        block_size,
+    )
+
+    properties = op_invoke_info.get_memory_access_properties()
+    _accumulate_compute_ops(
+        properties,
+        hidden_states.dtype,
+        mma_ops=breakdown["mma_total"],
+        gp_ops=breakdown["gp_total"],
+    )
+    properties.memory_readwrite_bytes += breakdown["bytes_total"]
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.minimax_sparse_attention.default)
+def _(
+    op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    query = op_invoke_info.args[0]
+    seq_lens = op_invoke_info.args[4]
+    query_lens = op_invoke_info.args[5]
+    num_q_heads = op_invoke_info.kwargs["num_q_heads"]
+    num_kv_heads = op_invoke_info.kwargs["num_kv_heads"]
+    head_dim = op_invoke_info.kwargs["head_dim"]
+    topk_blocks = op_invoke_info.kwargs["topk_blocks"]
+    block_size = op_invoke_info.kwargs["block_size"]
+    local_blocks = op_invoke_info.kwargs["local_blocks"]
+
+    breakdown = _estimate_minimax_sparse_attention_breakdown(
+        query,
+        seq_lens,
+        query_lens,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        topk_blocks,
+        block_size,
+        local_blocks,
+    )
+
+    properties = op_invoke_info.get_memory_access_properties(exclude_input_ids={1, 2})
+    _accumulate_compute_ops(
+        properties,
+        query.dtype,
+        mma_ops=breakdown["mma_total"],
+        gp_ops=breakdown["gp_total"],
+    )
+    properties.memory_readwrite_bytes += breakdown["bytes_total"]
+    return properties
+
+
 _load_custom_op()
