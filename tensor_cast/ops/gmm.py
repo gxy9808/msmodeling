@@ -171,3 +171,24 @@ def _(
     M = sum(xi.shape[0] for xi in x)
     N = w[0].shape[1] if w else 0
     return torch.empty((M, N), dtype=out_dtype, device="meta")
+
+
+@register_tensor_cast_op("grouped_matmul_fp8_m3_swiglu_quant")
+@register_tensor_cast_op("grouped_matmul_mxfp4_m3_swiglu_quant")
+def _(
+    x: List[torch.Tensor],
+    w: List[torch.Tensor],
+    w_scale: List[torch.Tensor],
+    x_scale: List[torch.Tensor],
+    bias: List[Optional[torch.Tensor]],
+    out_dtype: Optional[torch.dtype],
+    alpha: float,
+    limit: float,
+    group_size: int,
+) -> torch.Tensor:
+    if out_dtype is None:
+        out_dtype = x[0].dtype if x else torch.float32
+    M = sum(xi.shape[0] for xi in x)
+    N = w[0].shape[1] if w else 0
+    swiglu_out_shape = (M, N)
+    return torch.empty(swiglu_out_shape, dtype=out_dtype, device="meta")

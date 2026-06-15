@@ -25,6 +25,11 @@ class GroupedMatmulSwigluPass(TensorCastGraphModulePass):
         torch.ops.tensor_cast.grouped_matmul_mxfp4.default: torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu.default,
     }
 
+    _m3_quant_op_map = {
+        torch.ops.tensor_cast.grouped_matmul_fp8.default: torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default,
+        torch.ops.tensor_cast.grouped_matmul_mxfp4.default: torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu_quant.default,
+    }
+
     def __call__(self, gm: fx.GraphModule) -> fx.GraphModule:
         graph = gm.graph
         modified = False
@@ -50,14 +55,28 @@ class GroupedMatmulSwigluPass(TensorCastGraphModulePass):
                 continue
 
             is_m3 = node.target == torch.ops.tensor_cast.m3_swiglu.default
-            op_map = self._m3_op_map if is_m3 else self._op_map
-            fused_target = op_map[matmul_node.target]
+            is_m3_quant = node.target == torch.ops.tensor_cast.m3_swiglu_quant.default
+
+            if is_m3_quant:
+                op_map = self._m3_quant_op_map
+            elif is_m3:
+                op_map = self._m3_op_map
+            else:
+                op_map = self._op_map
+            fused_target = op_map.get(matmul_node.target)
+            if fused_target is None:
+                continue
 
             new_args = tuple(matmul_node.args)
             if is_m3 and len(node.args) >= 4:
                 alpha = node.args[2]
                 limit = node.args[3]
                 new_args = tuple(matmul_node.args) + (alpha, limit)
+            elif is_m3_quant and len(node.args) >= 5:
+                alpha = node.args[2]
+                limit = node.args[3]
+                group_size = node.args[4]
+                new_args = tuple(matmul_node.args) + (alpha, limit, group_size)
 
             with graph.inserting_before(node):
                 fused_node = graph.create_node(
@@ -81,9 +100,9 @@ class GroupedMatmulSwigluPass(TensorCastGraphModulePass):
     def _is_valid_swiglu_start(self, node: fx.Node) -> bool:
         if node.op != "call_function":
             return False
-        if node.target not in (torch.ops.tensor_cast.swiglu.default, torch.ops.tensor_cast.m3_swiglu.default):
+        if node.target not in (torch.ops.tensor_cast.swiglu.default, torch.ops.tensor_cast.m3_swiglu.default, torch.ops.tensor_cast.m3_swiglu_quant.default):
             return False
-        if len(node.args) not in (2, 4):
+        if len(node.args) not in (2, 4, 5):
             return False
         return True
 
@@ -161,7 +180,7 @@ class GroupedMatmulSwigluPass(TensorCastGraphModulePass):
             return False
         if node.op != "call_function":
             return False
-        return node.target in self._op_map or node.target in self._m3_op_map
+        return node.target in self._op_map or node.target in self._m3_op_map or node.target in self._m3_quant_op_map
 
     def _check_user_counts(self, split_node: fx.Node, gate_node: fx.Node, up_node: fx.Node) -> bool:
         if len(split_node.users) != 2:

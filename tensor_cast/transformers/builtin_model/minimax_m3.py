@@ -163,15 +163,53 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
             )
         return torch.ops.tensor_cast.grouped_matmul(x, weights, bias)
 
+
+
     def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
         gate, up = gate_up.chunk(2, dim=-1)
         return torch.ops.tensor_cast.m3_swiglu(gate, up, self.swiglu_alpha, self.swiglu_limit)
 
+    def _apply_gate_quant(self, gate_up: torch.Tensor, group_size: int = 128):
+        gate, up = gate_up.chunk(2, dim=-1)
+        return torch.ops.tensor_cast.m3_swiglu_quant(gate, up, self.swiglu_alpha, self.swiglu_limit, group_size)
+
+    def _grouped_matmul_with_prequant(
+        self,
+        x: list[torch.Tensor],
+        weights: list[torch.Tensor],
+        weight_scales: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
+        bias = self._bias_list(len(weights))
+        quantized_x = []
+        x_scale = []
+        for xi in x:
+            xi, scale = torch.ops.tensor_cast.dynamic_quantize_symmetric(
+                xi,
+                dims=[-1],
+                scale_dtype=torch.float32,
+                out_dtype=torch.int8,
+            )
+            quantized_x.append(xi)
+            x_scale.append(scale)
+        return torch.ops.tensor_cast.grouped_matmul_fp8(
+            quantized_x,
+            weights,
+            weight_scales,
+            x_scale,
+            bias,
+            out_dtype=torch.bfloat16,
+        )
+
     def _run_routed_experts(self, dispatched_hidden_states: list[torch.Tensor]) -> list[torch.Tensor]:
         gate_up = self._grouped_matmul(dispatched_hidden_states, self._gate_up_weights, self._gate_up_scales)
-        activated = self._apply_gate(gate_up)
-        activated_by_expert = self._split_by_inputs(activated, dispatched_hidden_states)
-        down = self._grouped_matmul(activated_by_expert, self._down_weights, self._down_scales)
+        if self.quant_type == LinearQuantType.FP8:
+            activated = self._apply_gate_quant(gate_up)
+            activated_by_expert = self._split_by_inputs(activated, dispatched_hidden_states)
+            down = self._grouped_matmul_with_prequant(activated_by_expert, self._down_weights, self._down_scales)
+        else:
+            activated = self._apply_gate(gate_up)
+            activated_by_expert = self._split_by_inputs(activated, dispatched_hidden_states)
+            down = self._grouped_matmul(activated_by_expert, self._down_weights, self._down_scales)
         return self._split_by_inputs(down, dispatched_hidden_states)
 
     def forward(
@@ -207,8 +245,16 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
         final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
         final_hidden_states = final_hidden_states.view(original_shape)
+
         if self.shared_experts and self.num_external_shared_experts == 0 and not skip_shared_experts:
-            final_hidden_states = final_hidden_states + self._run_shared_experts(hidden_states)
+            shared_output = self._run_shared_experts(hidden_states)
+            if self.ep_group.world_size > 1:
+                shared_output = self.ep_group.all_reduce(shared_output)
+            final_hidden_states = final_hidden_states + shared_output
+
+        if self.ep_group.world_size > 1:
+            final_hidden_states = self.ep_group.all_reduce(final_hidden_states)
+
         return final_hidden_states.to(hidden_states.dtype)
 
 

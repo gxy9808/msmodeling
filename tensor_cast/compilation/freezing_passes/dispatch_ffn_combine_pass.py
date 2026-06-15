@@ -49,6 +49,11 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu.default,
     }
 
+    _GROUPED_MATMUL_M3_SWIGLU_QUANT_OPS = {
+        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default,
+        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu_quant.default,
+    }
+
     _LINEAR_FFN_OPS = {
         torch.ops.tensor_cast.static_quant_linear.default,
         torch.ops.tensor_cast.static_quant_linear_int4.default,
@@ -68,6 +73,7 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
     _SWIGLU_OPS = {
         torch.ops.tensor_cast.swiglu.default,
         torch.ops.tensor_cast.m3_swiglu.default,
+        torch.ops.tensor_cast.m3_swiglu_quant.default,
         torch.ops.tensor_cast.grouped_matmul_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_quant_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_quant_int4_swiglu.default,
@@ -78,6 +84,8 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         torch.ops.tensor_cast.grouped_matmul_quant_int4_m3_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu.default,
+        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default,
+        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu_quant.default,
     }
 
     _DFC_OP_MAP_GMM = {
@@ -94,6 +102,8 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         torch.ops.tensor_cast.grouped_matmul_quant_int4_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_quant_int4_m3.default,
         torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_fp8_m3.default,
         torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_mxfp4_m3.default,
+        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default: torch.ops.tensor_cast.dispatch_ffn_combine_fp8_m3.default,
+        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu_quant.default: torch.ops.tensor_cast.dispatch_ffn_combine_mxfp4_m3.default,
     }
 
     _DFC_OP_MAP_LINEAR = {
@@ -208,7 +218,10 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
             node.op == "call_function" and node.target in self._GROUPED_MATMUL_M3_SWIGLU_OPS
             for node in region_nodes
         ) or any(
-            node.op == "call_function" and node.target == torch.ops.tensor_cast.m3_swiglu.default
+            node.op == "call_function" and node.target in self._GROUPED_MATMUL_M3_SWIGLU_QUANT_OPS
+            for node in region_nodes
+        ) or any(
+            node.op == "call_function" and node.target in (torch.ops.tensor_cast.m3_swiglu.default, torch.ops.tensor_cast.m3_swiglu_quant.default)
             for node in region_nodes
         )
 
@@ -441,7 +454,7 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         return node.op == "call_function" and node.target in self._GROUPED_MATMUL_SWIGLU_OPS
 
     def _is_grouped_matmul_m3_swiglu(self, node: fx.Node) -> bool:
-        return node.op == "call_function" and node.target in self._GROUPED_MATMUL_M3_SWIGLU_OPS
+        return node.op == "call_function" and node.target in self._GROUPED_MATMUL_M3_SWIGLU_OPS or node.target in self._GROUPED_MATMUL_M3_SWIGLU_QUANT_OPS
 
     def _is_linear_ffn(self, node: fx.Node) -> bool:
         return node.op == "call_function" and node.target in self._LINEAR_FFN_OPS

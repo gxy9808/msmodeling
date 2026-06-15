@@ -19,3 +19,18 @@ def _(gate: torch.Tensor, up: torch.Tensor, alpha: float, limit: float) -> torch
 
     output_shape = list(gate.shape)
     return torch.empty(output_shape, dtype=gate.dtype, device="meta")
+
+
+@register_tensor_cast_op("m3_swiglu_quant")
+def _(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    alpha: float,
+    limit: float,
+    group_size: int,
+) -> torch.Tensor:
+    if gate.shape != up.shape:
+        raise RuntimeError(f"Shape mismatch in m3_swiglu_quant: gate {gate.shape} vs up {up.shape}")
+
+    output_shape = list(gate.shape)
+    return torch.empty(output_shape, dtype=gate.dtype, device="meta")
