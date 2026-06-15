@@ -173,6 +173,45 @@ class MiniMaxM3MoELayer(MoELayer):
         self.fused_moe.swiglu_limit = module.experts.swiglu_limit
         self.fused_moe.quant_type = quant_type
         self.fused_moe.refresh_expert_weight_cache()
+        self.gate_weight = self.gate.weight.data if self.gate is not None else None
+        self.num_local_experts = self.fused_moe.num_global_experts
+
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ):
+        if self.gate_weight is not None:
+            scores = torch.ops.tensor_cast.moe_decode_score(hidden_states, self.gate_weight)
+        else:
+            gate_output = self.gate(hidden_states)
+            if isinstance(gate_output, tuple) and len(gate_output) >= 2:
+                if len(gate_output) == 3:
+                    router_logits, topk_weights, topk_indices = gate_output
+                else:
+                    topk_indices, topk_weights = gate_output[0], gate_output[1]
+                if topk_indices.shape[0] == hidden_states.shape[0]:
+                    topk_indices = topk_indices.view(*hidden_states.shape[:-1], topk_indices.shape[-1])
+                    topk_weights = topk_weights.view(*hidden_states.shape[:-1], topk_weights.shape[-1])
+                return topk_indices, topk_weights
+            scores = gate_output
+
+        partial_weights, partial_indices = torch.ops.tensor_cast.moe_topk_index_partial(
+            scores, self.top_k,
+        )
+        topk_weights, topk_indices = torch.ops.tensor_cast.moe_topk_index_merge(
+            partial_weights, partial_indices,
+        )
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        if topk_indices.shape[0] == hidden_states.shape[0]:
+            topk_indices = topk_indices.view(*hidden_states.shape[:-1], topk_indices.shape[-1])
+            topk_weights = topk_weights.view(*hidden_states.shape[:-1], topk_weights.shape[-1])
+
+        return topk_indices, topk_weights
 
 
 class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
@@ -285,6 +324,21 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
 
         expert_indices = topk_indices
         expert_weights = topk_weights
+
+        reordered = torch.ops.tensor_cast.moe_post_reorder(
+            hidden_states, topk_indices, self.num_global_experts,
+        )
+        seg_indptr = torch.ops.tensor_cast.moe_compute_seg_indptr(
+            topk_indices, self.num_global_experts,
+        )
+        masked_m = torch.ops.tensor_cast.moe_compute_masked_m(seg_indptr)
+        src2dst = torch.ops.tensor_cast.moe_compute_src2dst(
+            topk_indices, self.num_global_experts,
+        )
+        gateup_input = torch.ops.tensor_cast.moe_fill_gateup_input(
+            hidden_states, seg_indptr,
+        )
+
         dispatched_hidden_states = self.dispatch_tokens(
             hidden_states,
             expert_indices,

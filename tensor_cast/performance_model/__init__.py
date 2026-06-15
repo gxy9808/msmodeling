@@ -15,6 +15,11 @@ from .op_invoke_info import OpInvokeInfo
 from .utils import bytes_of_elements, bytes_of_tensor, is_noop_self_copy_op, is_view_op
 
 logger = logging.getLogger(__name__)
+
+_ADD_RMS_NORM2_FLOOR_S = 100 * 1e-6
+_MOE_DECODE_SCORE_FLOOR_S = 90 * 1e-6
+_MOE_TOPK_INDEX_PARTIAL_FLOOR_S = 30 * 1e-6
+_MOE_POST_REORDER_FLOOR_S = 25 * 1e-6
 # Deduplication: Each (dtype, category) combination is warned only once to avoid hundreds of duplicate logs
 _warned_unsupported_dtypes = set()
 
@@ -1192,6 +1197,159 @@ def _(
         properties_i = _static_quant_linear_properties_helper(op_invoke_info, xi, wi, None, biasi, is_int4=False)
         properties.combine(properties_i, compute_only=True)
     return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_decode_score.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    hidden_states = op_invoke_info.args[0]
+    gate_weight = op_invoke_info.args[1]
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[-1]
+    num_experts = gate_weight.shape[0]
+    properties = op_invoke_info.get_memory_access_properties()
+    flops = 2 * num_tokens * hidden_size * num_experts
+    dtype = hidden_states.dtype
+    compute_ops = properties.compute_ops.setdefault(dtype, OpInvokeInfo.ComputeOps())
+    compute_ops.mma_ops = flops
+    sigmoid_gp_ops = num_tokens * num_experts * 5
+    compute_ops.gp_ops = sigmoid_gp_ops
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_topk_index_partial.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    scores = op_invoke_info.args[0]
+    top_k = op_invoke_info.args[1]
+    num_tokens = scores.shape[0]
+    num_experts = scores.shape[1]
+    properties = op_invoke_info.get_memory_access_properties()
+    import math
+    n = num_experts
+    k = top_k
+    if n > 1:
+        n_dims = int(math.log2(n))
+        sort_ops = n_dims * (n_dims + 1) // 2
+        topk_gp_ops = num_tokens * sort_ops * 3
+    else:
+        topk_gp_ops = 0
+    compute_ops = properties.compute_ops.setdefault(torch.float32, OpInvokeInfo.ComputeOps())
+    compute_ops.gp_ops = topk_gp_ops
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_topk_index_merge.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    partial_weights = op_invoke_info.args[0]
+    properties = op_invoke_info.get_memory_access_properties()
+    num_chunks = partial_weights.shape[0] if partial_weights.dim() > 1 else 1
+    topk = partial_weights.shape[-1] if partial_weights.dim() > 1 else 1
+    total_items = num_chunks * topk
+    import math
+    if total_items > 1:
+        n_dims = int(math.log2(max(total_items, 2)))
+        merge_ops = n_dims * (n_dims + 1) // 2
+    else:
+        merge_ops = 0
+    compute_ops = properties.compute_ops.setdefault(torch.float32, OpInvokeInfo.ComputeOps())
+    compute_ops.gp_ops = merge_ops * 3
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_post_reorder.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    properties = op_invoke_info.get_memory_access_properties()
+    hidden_states = op_invoke_info.args[0]
+    topk_ids = op_invoke_info.args[1]
+    num_experts = op_invoke_info.args[2]
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[-1]
+    topk = topk_ids.shape[-1] if topk_ids.dim() > 1 else 1
+    reduce_ops = num_tokens * topk * hidden_size * 2
+    dtype = hidden_states.dtype
+    compute_ops = properties.compute_ops.setdefault(dtype, OpInvokeInfo.ComputeOps())
+    compute_ops.gp_ops = reduce_ops
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_fill_gateup_input.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    properties = op_invoke_info.get_memory_access_properties()
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_compute_seg_indptr.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    properties = op_invoke_info.get_memory_access_properties()
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_compute_src2dst.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    properties = op_invoke_info.get_memory_access_properties()
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.moe_compute_masked_m.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    properties = op_invoke_info.get_memory_access_properties()
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.add_rms_norm2.default, override=True)
+def _(op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    hidden_states = op_invoke_info.args[0]
+    residual = op_invoke_info.args[1]
+    ln_weight = op_invoke_info.args[2]
+    eps = op_invoke_info.args[3]
+    num_elements = hidden_states.numel()
+    hidden_size = hidden_states.shape[-1]
+    properties = op_invoke_info.get_memory_access_properties()
+    norm_gp_ops = num_elements * 8
+    compute_ops = properties.compute_ops.setdefault(hidden_states.dtype, OpInvokeInfo.ComputeOps())
+    compute_ops.gp_ops = norm_gp_ops
+    properties.memory_readwrite_bytes += int(num_elements * hidden_states.element_size() * 3)
+    return properties
+
+
+@register_op_estimator(torch.ops.tensor_cast.add_rms_norm2.default, None)
+def _estimate_add_rms_norm2(op_invoke_info: OpInvokeInfo, device_profile: DeviceProfile) -> PerformanceModel.Result:
+    result = _estimate_default(op_invoke_info, device_profile)
+    if result.execution_time_s < _ADD_RMS_NORM2_FLOOR_S:
+        result.execution_time_s = _ADD_RMS_NORM2_FLOOR_S
+    return result
+
+
+@register_op_estimator(torch.ops.tensor_cast.moe_decode_score.default, None)
+def _estimate_moe_decode_score(op_invoke_info: OpInvokeInfo, device_profile: DeviceProfile) -> PerformanceModel.Result:
+    result = _estimate_default(op_invoke_info, device_profile)
+    if result.execution_time_s < _MOE_DECODE_SCORE_FLOOR_S:
+        result.execution_time_s = _MOE_DECODE_SCORE_FLOOR_S
+    return result
+
+
+@register_op_estimator(torch.ops.tensor_cast.moe_topk_index_partial.default, None)
+def _estimate_moe_topk_index_partial(op_invoke_info: OpInvokeInfo, device_profile: DeviceProfile) -> PerformanceModel.Result:
+    result = _estimate_default(op_invoke_info, device_profile)
+    if result.execution_time_s < _MOE_TOPK_INDEX_PARTIAL_FLOOR_S:
+        result.execution_time_s = _MOE_TOPK_INDEX_PARTIAL_FLOOR_S
+    return result
+
+
+@register_op_estimator(torch.ops.tensor_cast.moe_post_reorder.default, None)
+def _estimate_moe_post_reorder(op_invoke_info: OpInvokeInfo, device_profile: DeviceProfile) -> PerformanceModel.Result:
+    result = _estimate_default(op_invoke_info, device_profile)
+    if result.execution_time_s < _MOE_POST_REORDER_FLOOR_S:
+        result.execution_time_s = _MOE_POST_REORDER_FLOOR_S
+    return result
 
 
 def _swiglu_fusion_properties_helper(

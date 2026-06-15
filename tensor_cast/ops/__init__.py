@@ -12,5 +12,6 @@ from . import (  # noqa: F401
     quantization,
     rotary_embedding,
     minimax_m3_sparse_attention,
+    moe_routing,
     swiglu,
 )
