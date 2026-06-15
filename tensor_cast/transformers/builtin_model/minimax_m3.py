@@ -23,11 +23,94 @@ from ..custom_model_registry import (
 )
 from ..model import TransformerModel
 from ...layers.minimax_m3_attention import MiniMaxM3AttentionWrapper
+from ...layers.utils import ModelWrapperBase
 
 logger = logging.getLogger(__name__)
 
 _EMPTY_VISUAL_LAYERS_ATTR = "_tensor_cast_empty_visual_layers"
 
+
+
+
+class MiniMaxM3DecoderLayerWrapper(ModelWrapperBase):
+    def __init__(self, layer):
+        super().__init__(layer)
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        eps = getattr(self._inner.input_layernorm, 'variance_epsilon', None) or self._inner.input_layernorm.eps
+        input_ln_weight = self._inner.input_layernorm.weight.data
+        post_attn_ln_weight = self._inner.post_attention_layernorm.weight.data
+        use_gemma_norm = getattr(self._inner, "use_gemma_norm", False)
+        if use_gemma_norm:
+            input_ln_weight = 1.0 + input_ln_weight
+            post_attn_ln_weight = 1.0 + post_attn_ln_weight
+
+        residual = hidden_states
+        hidden_states, residual = torch.ops.tensor_cast.add_rms_norm2(
+            hidden_states, residual, input_ln_weight, eps,
+        )
+
+        attn_out, _ = self._inner.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = attn_out
+
+        hidden_states, residual = torch.ops.tensor_cast.add_rms_norm2(
+            hidden_states, residual, post_attn_ln_weight, eps,
+        )
+
+        hidden_states = self._inner.mlp(hidden_states)
+
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+def _patch_minimax_m3_rmsnorm(model: TransformerModel) -> TransformerModel:
+    unwrapped = model.unwrap()
+    if not hasattr(unwrapped, "layers"):
+        candidates = [
+            getattr(unwrapped, "language_model", None),
+            getattr(getattr(unwrapped, "model", None), "language_model", None),
+            getattr(getattr(unwrapped, "language_model", None), "model", None),
+        ]
+        for candidate in candidates:
+            if candidate is not None and hasattr(candidate, "layers"):
+                unwrapped = candidate
+                break
+        else:
+            model_attr = getattr(unwrapped, "model", None)
+            if hasattr(model_attr, "layers"):
+                unwrapped = model_attr
+            else:
+                logger.warning("Cannot find layers for M3 rmsnorm patch")
+                return model
+
+    for i, layer in enumerate(unwrapped.layers):
+        inner = layer
+        while hasattr(inner, "_inner"):
+            inner = inner._inner
+        if hasattr(inner, "input_layernorm") and hasattr(inner, "post_attention_layernorm"):
+            wrapped = MiniMaxM3DecoderLayerWrapper(inner)
+            parent = unwrapped
+            unwrapped.layers[i] = wrapped
+
+    return model
 
 class MiniMaxM3ExpertMLP(torch.nn.Module):
     """M3 Expert MLP using gate_proj + up_proj + down_proj with standard swiglu.
@@ -466,6 +549,7 @@ def _(model: TransformerModel):
     _ensure_empty_visual_layers_for_reuse(model)
     model = maybe_reuse_layers(model)
     model = patch_minimax_m3_attention(model)
+    model = _patch_minimax_m3_rmsnorm(model)
     model = patch_attention(model)
     model = patch_moe(
         model,
