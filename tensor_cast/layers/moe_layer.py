@@ -293,6 +293,8 @@ class ParallelMoELayer(ModelWrapperBase):
     def _dp_transform_enter(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, int]:
         """Pre-MoE DP domain transform. Returns (transformed, num_tokens_original)."""
         num_tokens = hidden_states.shape[0]
+        if getattr(self._inner.fused_moe, 'use_all_reduce_instead_of_slice_gather', False):
+            return hidden_states, num_tokens
         if self.has_ep:
             divisor = self._get_dp_alignment()
             padding_tokens = (-num_tokens) % divisor
@@ -305,6 +307,8 @@ class ParallelMoELayer(ModelWrapperBase):
 
     def _dp_transform_exit(self, hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
         """Post-MoE DP domain transform. Restores original token count."""
+        if getattr(self._inner.fused_moe, 'use_all_reduce_instead_of_slice_gather', False):
+            return hidden_states[:num_tokens]
         if self.has_ep:
             hidden_states = self.global_tp_group.all_gather(hidden_states, dim=0)
         else:

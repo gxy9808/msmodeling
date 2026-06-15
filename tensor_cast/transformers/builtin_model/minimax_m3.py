@@ -97,6 +97,7 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
     swiglu_alpha = 1.0
     swiglu_limit = 1.0
     quant_type = None
+    use_all_reduce_instead_of_slice_gather = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
