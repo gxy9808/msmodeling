@@ -226,22 +226,10 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
     ) -> torch.Tensor:
         bias = self._bias_list(len(weights))
         if self.quant_type == LinearQuantType.FP8:
-            quantized_x = []
-            x_scale = []
-            for xi in x:
-                xi, scale = torch.ops.tensor_cast.dynamic_quantize_symmetric(
-                    xi,
-                    dims=[-1],
-                    scale_dtype=torch.float32,
-                    out_dtype=torch.int8,
-                )
-                quantized_x.append(xi)
-                x_scale.append(scale)
-            return torch.ops.tensor_cast.grouped_matmul_fp8(
-                quantized_x,
+            return torch.ops.tensor_cast.grouped_matmul_fp8_bf16(
+                x,
                 weights,
                 weight_scales,
-                x_scale,
                 bias,
                 out_dtype=x[0].dtype if x else torch.bfloat16,
             )
@@ -264,22 +252,10 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
         weight_scales: list[torch.Tensor] | None,
     ) -> torch.Tensor:
         bias = self._bias_list(len(weights))
-        quantized_x = []
-        x_scale = []
-        for xi in x:
-            xi, scale = torch.ops.tensor_cast.dynamic_quantize_symmetric(
-                xi,
-                dims=[-1],
-                scale_dtype=torch.float32,
-                out_dtype=torch.int8,
-            )
-            quantized_x.append(xi)
-            x_scale.append(scale)
-        return torch.ops.tensor_cast.grouped_matmul_fp8(
-            quantized_x,
+        return torch.ops.tensor_cast.grouped_matmul_fp8_bf16(
+            x,
             weights,
             weight_scales,
-            x_scale,
             bias,
             out_dtype=torch.bfloat16,
         )
