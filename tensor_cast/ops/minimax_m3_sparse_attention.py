@@ -46,6 +46,7 @@ def _(
     query_lens: torch.Tensor,
     block_table: torch.Tensor,
     *,
+    hidden_size: int,
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
@@ -57,7 +58,7 @@ def _(
     MiniMax-M3 sparse attention fused op.
 
     Boundary:
-      read Q + selected K/V cache -> sparse QK/PV attention -> output O.
+      hidden -> qkv_proj -> QK norm + RoPE -> sparse QK/PV attention -> o_proj -> output.
 
     Performance formula: see M3-msmodeling.md section 4.2.
     """

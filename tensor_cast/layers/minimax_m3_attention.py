@@ -91,6 +91,7 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
             seq_lens,
             query_lens,
             block_table,
+            hidden_size=self.hidden_size,
             num_q_heads=self.num_q_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,

@@ -2421,6 +2421,7 @@ def _estimate_minimax_sparse_attention_breakdown(
     query: torch.Tensor,
     seq_lens: torch.Tensor,
     query_lens: torch.Tensor,
+    hidden_size: int,
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
@@ -2431,8 +2432,10 @@ def _estimate_minimax_sparse_attention_breakdown(
     """Estimate FLOPs and memory bytes for minimax_sparse_attention.
 
     Formula reference: M3-msmodeling.md section 4.2.
+    Boundary: hidden -> qkv_proj -> QK norm + RoPE -> sparse attention -> o_proj -> output.
     """
     T = math.prod(query.shape[:-1])
+    H = hidden_size
     N_q = num_q_heads
     N_kv = num_kv_heads
     D = head_dim
@@ -2442,11 +2445,25 @@ def _estimate_minimax_sparse_attention_breakdown(
 
     s = query.element_size()
 
+    # --- QKV Projection ---
+    # qkv_proj: [T, H] @ [H, N_q*D + 2*N_kv*D] -> [T, N_q*D + 2*N_kv*D]
+    qkv_out_dim = N_q * D + 2 * N_kv * D
+    qkv_proj_mma = 2 * T * H * qkv_out_dim
+    qkv_proj_bytes = T * H * s + H * qkv_out_dim * s + T * qkv_out_dim * s
+
+    # --- QK Norm + RoPE ---
+    # Per-head RMSNorm on Q and K, then RoPE
+    qk_norm_gp = 12 * T * N_q * D + 12 * T * N_kv * D
+    qk_norm_bytes = 4 * T * N_q * D * s + 4 * T * N_kv * D * s
+    rope_gp = 6 * T * (N_q + N_kv) * D
+    rope_bytes = 2 * T * (N_q + N_kv) * D * s
+
+    # --- Sparse Attention ---
     Q_b_list = _safe_tensor_int_list(query_lens, fallback_total=T)
     L_b_list = _safe_tensor_int_list(seq_lens, fallback_total=T)
 
-    mma_total = 0
-    gp_total = 0
+    attn_mma = 0
+    attn_gp = 0
     qo_bytes = 2 * s * T * N_q * D
     kv_bytes = 0
     topk_bytes = 4 * T * N_kv * K
@@ -2456,15 +2473,23 @@ def _estimate_minimax_sparse_attention_breakdown(
         A_b = min(L_b, min(B_n, K + R) * B_s)
 
         # MMA: QK^T + PV => 4 * Q_b * N_q * A_b * D
-        mma_total += 4 * Q_b * N_q * A_b * D
+        attn_mma += 4 * Q_b * N_q * A_b * D
 
         # GP: softmax ~6 ops per (Q_b * N_q * A_b)
-        gp_total += 6 * Q_b * N_q * A_b
+        attn_gp += 6 * Q_b * N_q * A_b
 
         # KV read: 2 * s * Q_b * A_b * N_kv * D
         kv_bytes += 2 * s * Q_b * A_b * N_kv * D
 
-    bytes_total = qo_bytes + kv_bytes + topk_bytes
+    # --- O Projection ---
+    # o_proj: [T, N_q*D] @ [N_q*D, H] -> [T, H]
+    o_proj_mma = 2 * T * N_q * D * H
+    o_proj_bytes = T * N_q * D * s + N_q * D * H * s + T * H * s
+
+    # --- Aggregate ---
+    mma_total = qkv_proj_mma + attn_mma + o_proj_mma
+    gp_total = qk_norm_gp + rope_gp + attn_gp
+    bytes_total = qkv_proj_bytes + qk_norm_bytes + rope_bytes + qo_bytes + kv_bytes + topk_bytes + o_proj_bytes
 
     return {
         "mma_total": mma_total,
@@ -2517,6 +2542,7 @@ def _(
     query = op_invoke_info.args[0]
     seq_lens = op_invoke_info.args[4]
     query_lens = op_invoke_info.args[5]
+    hidden_size = op_invoke_info.kwargs["hidden_size"]
     num_q_heads = op_invoke_info.kwargs["num_q_heads"]
     num_kv_heads = op_invoke_info.kwargs["num_kv_heads"]
     head_dim = op_invoke_info.kwargs["head_dim"]
@@ -2528,6 +2554,7 @@ def _(
         query,
         seq_lens,
         query_lens,
+        hidden_size,
         num_q_heads,
         num_kv_heads,
         head_dim,
