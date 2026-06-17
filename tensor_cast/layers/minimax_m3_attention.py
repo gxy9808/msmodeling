@@ -77,10 +77,20 @@ def _fused_decoder_layer_forward(self, hidden_states, **kwargs):
 class MiniMaxM3AttentionWrapper(torch.nn.Module):
     """Wrapper for MiniMax-M3 attention that routes dense/sparse layers.
 
-    Dense layers use the standard tensor_cast attention path.
-    Sparse layers call minimax_indexer + minimax_sparse_attention.
-    For sparse layers, Q/K/index Q/K norms are explicitly called as rms_norm ops
-    so they appear as independent operators matching profiling's 234 calls.
+    Dense layers use the standard tensor_cast attention path (HF attention forward
+    which calls q_proj, q_norm, fused_rope, attention, o_proj).
+
+    Sparse layers mirror the sglang NPU call chain:
+      1. q_proj, q_norm (rms_norm), fused_rope (InterleaveRope)
+      2. k_proj, k_norm (rms_norm)
+      3. index_q_proj, index_q_norm (rms_norm), fused_rope (InterleaveRope)
+      4. index_k_proj, index_k_norm (rms_norm)
+      5. minimax_indexer (index projection + block scoring + top-k)
+      6. minimax_sparse_attention (qkv_proj + sparse attn + o_proj)
+
+    Steps 1-4 produce separate rms_norm and fused_rope ops matching NPU profiling.
+    Steps 5-6 are fused ops whose performance estimates do NOT include RoPE or
+    QK norm (those are accounted for by the separate calls above).
     """
 
     def __init__(
@@ -137,49 +147,73 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
         while hasattr(inner, "_inner"):
             inner = inner._inner
 
-        # --- Q norm + K norm (all 60 layers have these) ---
-        q_tensor = hidden_states[:, :self.num_q_heads * self.head_dim]
-        k_tensor = hidden_states[:, :self.num_kv_heads * self.head_dim]
-        q_normed = inner.q_norm(q_tensor)
-        k_normed = inner.k_norm(k_tensor)
-
-        # --- Q/K fused_rope (all layers, matching NPU InterleaveRope profiling) ---
-        # sglang NPU: self.rotary_emb(positions, q, k) -> fused_rope_qk_mqa
         position_embeddings = kwargs.get("position_embeddings", None)
-        fused_rope_residual = torch.zeros_like(hidden_states)
+
+        if hidden_states.ndim == 3:
+            num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
+        else:
+            num_tokens = hidden_states.shape[0]
+
+        # --- Q/K norm (all 60 layers: separate rms_norm ops) ---
+        # In sglang: qkv_proj(hidden_states) -> split q,k,v -> _qk_norm(q, k)
+        # q_norm is per-head RMSNorm over head_dim, called on q reshaped to
+        # (num_tokens, num_heads, head_dim). rms_norm preserves input shape.
+        q_for_norm = hidden_states.new_empty(num_tokens, self.num_q_heads, self.head_dim)
+        k_for_norm = hidden_states.new_empty(num_tokens, self.num_kv_heads, self.head_dim)
+        q_normed = inner.q_norm(q_for_norm)
+        k_normed = inner.k_norm(k_for_norm)
+
+        # --- Q/K fused_rope (all 60 layers: separate InterleaveRope ops) ---
+        # In sglang: self.rotary_emb(positions, q, k) -> fused_rope_qk_mqa
+        # fused_rope input: q (num_tokens, num_q_heads, head_dim),
+        #                   k (num_tokens, num_kv_heads, head_dim),
+        #                   cos_sin (num_tokens, rotary_dim * 2)
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            q_3d = q_normed.view(-1, self.num_q_heads, self.head_dim)
-            k_3d = k_normed.view(-1, self.num_kv_heads, self.head_dim)
-            cos_2d = cos.reshape(-1, cos.shape[-1])
-            sin_2d = sin.reshape(-1, sin.shape[-1])
-            cos_sin = torch.cat([cos_2d, sin_2d], dim=-1)
+            q_3d = q_normed
+            k_3d = k_normed
+            if cos.ndim == 3:
+                cos_flat = cos.reshape(num_tokens, cos.shape[-1])
+                sin_flat = sin.reshape(num_tokens, sin.shape[-1])
+            else:
+                cos_flat = cos.reshape(num_tokens, -1)
+                sin_flat = sin.reshape(num_tokens, -1)
+            cos_sin = torch.cat([cos_flat, sin_flat], dim=-1)
             q_rope, k_rope = torch.ops.tensor_cast.fused_rope(
                 q_3d, k_3d, cos_sin, self.rotary_dim, True
             )
 
-        # --- Index Q norm + Index K norm (sparse layers only, via self.indexer) ---
+        # --- Index Q/K norm (sparse layers only: separate rms_norm ops) ---
+        # In sglang: index_q_proj(hidden_states) -> _index_qk_norm(idx_q, idx_k)
+        # index_q_norm is per-head RMSNorm over indexer_head_dim.
         indexer = getattr(inner, "indexer", None)
         if indexer is not None:
-            idx_q_tensor = hidden_states[:, :self.num_indexer_heads * self.indexer_head_dim]
-            idx_k_tensor = hidden_states[:, :1 * self.indexer_head_dim]
-            idx_q_normed = indexer.q_norm(idx_q_tensor)
-            idx_k_normed = indexer.k_norm(idx_k_tensor)
+            idx_q_for_norm = hidden_states.new_empty(num_tokens, self.num_indexer_heads, self.indexer_head_dim)
+            idx_k_for_norm = hidden_states.new_empty(num_tokens, 1, self.indexer_head_dim)
+            idx_q_normed = indexer.q_norm(idx_q_for_norm)
+            idx_k_normed = indexer.k_norm(idx_k_for_norm)
 
-            # --- Index Q/K fused_rope (sparse layers only) ---
-            # sglang NPU: self.index_rotary_emb(positions, idx_q, idx_k) -> fused_rope_qk_mqa
+            # --- Index Q/K fused_rope (sparse layers only: separate InterleaveRope ops) ---
+            # In sglang: self.index_rotary_emb(positions, idx_q, idx_k) -> fused_rope_qk_mqa
+            # index_rotary_emb uses the same rotary_dim as the main rotary_emb.
+            # cos/sin have shape (batch, seq_len, rotary_dim), so cos_sin is
+            # (num_tokens, rotary_dim * 2).
             if position_embeddings is not None:
                 cos, sin = position_embeddings
-                idx_cos = cos[..., :self.indexer_head_dim].reshape(-1, self.indexer_head_dim)
-                idx_sin = sin[..., :self.indexer_head_dim].reshape(-1, self.indexer_head_dim)
+                if cos.ndim == 3:
+                    idx_cos = cos.reshape(num_tokens, cos.shape[-1])
+                    idx_sin = sin.reshape(num_tokens, sin.shape[-1])
+                else:
+                    idx_cos = cos.reshape(num_tokens, -1)
+                    idx_sin = sin.reshape(num_tokens, -1)
                 idx_cos_sin = torch.cat([idx_cos, idx_sin], dim=-1)
-                idx_q_3d = idx_q_normed.view(-1, self.num_indexer_heads, self.indexer_head_dim)
-                idx_k_3d = idx_k_normed.view(-1, 1, self.indexer_head_dim)
+                idx_q_3d = idx_q_normed
+                idx_k_3d = idx_k_normed
                 idx_q_rope, idx_k_rope = torch.ops.tensor_cast.fused_rope(
                     idx_q_3d, idx_k_3d, idx_cos_sin, self.rotary_dim, True
                 )
 
-        # --- Indexer + Sparse Attention ---
+        # --- Indexer (index projection + block scoring + top-k) ---
         topk_idx = torch.ops.tensor_cast.minimax_indexer(
             hidden_states,
             seq_lens,
@@ -193,6 +227,7 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
             block_size=self.block_size,
         )
 
+        # --- Sparse Attention (qkv_proj + sparse attn + o_proj) ---
         query = hidden_states
         key_cache = kwargs.get("kv_cache", None)
         if key_cache is not None and isinstance(key_cache, (list, tuple)):

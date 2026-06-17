@@ -2425,8 +2425,8 @@ def _estimate_minimax_indexer_breakdown(
 
     bytes_rope_only = 2 * T * N * D_r * s  # rope bytes only, norm bytes removed
     mma_total = index_q_proj_mma + index_k_proj_mma + index_qk_mma
-    gp_total = index_rope_gp + block_reduce_gp + topk_gp  # index_norm_gp removed: now called as independent rms_norm
-    bytes_total = bytes_projection + bytes_rope_only + bytes_cache_write + bytes_score + bytes_topk  # norm bytes removed
+    gp_total = block_reduce_gp + topk_gp  # index_norm_gp + index_rope_gp removed: now called as independent rms_norm and fused_rope
+    bytes_total = bytes_projection + bytes_cache_write + bytes_score + bytes_topk  # norm + rope bytes removed: now called as independent rms_norm and fused_rope
 
     return {
         "mma_total": mma_total,
@@ -2450,7 +2450,7 @@ def _estimate_minimax_sparse_attention_breakdown(
     """Estimate FLOPs and memory bytes for minimax_sparse_attention.
 
     Formula reference: M3-msmodeling.md section 4.2.
-    Boundary: hidden -> qkv_proj -> QK norm + RoPE -> sparse attention -> o_proj -> output.
+    Boundary: hidden -> qkv_proj -> sparse attention -> o_proj -> output. (QK norm and RoPE are separate ops)
     """
     T = math.prod(query.shape[:-1])
     H = hidden_size
@@ -2506,8 +2506,8 @@ def _estimate_minimax_sparse_attention_breakdown(
 
     # --- Aggregate ---
     mma_total = qkv_proj_mma + attn_mma + o_proj_mma
-    gp_total = rope_gp + attn_gp  # qk_norm_gp removed: now called as independent rms_norm
-    bytes_total = qkv_proj_bytes + rope_bytes + qo_bytes + kv_bytes + topk_bytes + o_proj_bytes  # qk_norm_bytes removed
+    gp_total = attn_gp  # qk_norm_gp + rope_gp removed: now called as independent rms_norm and fused_rope
+    bytes_total = qkv_proj_bytes + qo_bytes + kv_bytes + topk_bytes + o_proj_bytes  # qk_norm + rope bytes removed: now called as independent rms_norm and fused_rope
 
     return {
         "mma_total": mma_total,
