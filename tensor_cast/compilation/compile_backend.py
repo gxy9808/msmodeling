@@ -16,6 +16,7 @@ from .constant_folding import fold_meta_constants
 from .freezing_passes import patterns as freezing_patterns
 from .freezing_passes.dispatch_ffn_combine_pass import DispatchFFNCombinePass
 from .freezing_passes.grouped_matmul_swiglu_pass import GroupedMatmulSwigluPass
+from .freezing_passes.fused_rope_pass import FusedRopePass
 from .freezing_passes.sink_split_pass import SinkSplitPass
 from .passes.lift_quant_pass import LiftCombineQuantPass
 from .passes.merge_linear_pass import MergeLinearPass
@@ -80,6 +81,7 @@ class CompilerBackend:
             self.apply_redundant_node_elimination_pass(fx_graph, inputs)
             self.apply_quantization_passes(fx_graph, inputs)
             self.apply_pattern_match_passes(fx_graph, inputs)
+            self.apply_fused_rope_pass(fx_graph, inputs)
             self.apply_sequence_parallel_pass(fx_graph, inputs)
             return fx_graph
 
@@ -153,6 +155,24 @@ class CompilerBackend:
         logger.debug("Graph after pattern matching:")
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(gm.print_readable(print_output=False))
+
+    def apply_fused_rope_pass(self, gm: fx.GraphModule, inputs):
+        """Replace apply_rope with fused_rope for NPU profiling alignment.
+
+        On NPU, InterleaveRope/fused_rope_qk_mqa is a single fused kernel.
+        This pass replaces the decomposed apply_rope with fused_rope so
+        the simulation graph matches the NPU profiling operator count.
+        """
+        GraphTransformObserver = functools.partial(
+            torch.fx.passes.graph_transform_observer.GraphTransformObserver,
+            subsystem="fused_rope_pass",
+            log_url=config.compilation.debug.graph_log_url,
+        )
+        if config.compilation.fusion_patterns.enable_rope:
+            GraphTransformObserver(gm, "fused_rope_pass").apply_gm_pass(FusedRopePass())
+            logger.debug("Graph after fused_rope_pass:")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(gm.print_readable(print_output=False))
 
     def apply_sequence_parallel_pass(self, gm: fx.GraphModule, inputs):
         """Rewrite TP `all_reduce + norm` patterns into SP

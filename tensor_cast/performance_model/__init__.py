@@ -2423,9 +2423,10 @@ def _estimate_minimax_indexer_breakdown(
     # 4.1.5 Top-k Selection
     bytes_topk = 4 * sum_qb_nb_bn + 4 * T * N * K
 
+    bytes_rope_only = 2 * T * N * D_r * s  # rope bytes only, norm bytes removed
     mma_total = index_q_proj_mma + index_k_proj_mma + index_qk_mma
-    gp_total = index_norm_gp + index_rope_gp + block_reduce_gp + topk_gp
-    bytes_total = bytes_projection + bytes_norm_rope + bytes_cache_write + bytes_score + bytes_topk
+    gp_total = index_rope_gp + block_reduce_gp + topk_gp  # index_norm_gp removed: now called as independent rms_norm
+    bytes_total = bytes_projection + bytes_rope_only + bytes_cache_write + bytes_score + bytes_topk  # norm bytes removed
 
     return {
         "mma_total": mma_total,
@@ -2505,8 +2506,8 @@ def _estimate_minimax_sparse_attention_breakdown(
 
     # --- Aggregate ---
     mma_total = qkv_proj_mma + attn_mma + o_proj_mma
-    gp_total = qk_norm_gp + rope_gp + attn_gp
-    bytes_total = qkv_proj_bytes + qk_norm_bytes + rope_bytes + qo_bytes + kv_bytes + topk_bytes + o_proj_bytes
+    gp_total = rope_gp + attn_gp  # qk_norm_gp removed: now called as independent rms_norm
+    bytes_total = qkv_proj_bytes + rope_bytes + qo_bytes + kv_bytes + topk_bytes + o_proj_bytes  # qk_norm_bytes removed
 
     return {
         "mma_total": mma_total,
