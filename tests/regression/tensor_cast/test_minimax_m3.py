@@ -1,8 +1,20 @@
 import pytest
 import torch
 
+from tensor_cast.device import TEST_DEVICE
+from tensor_cast.performance_model.analytic import AnalyticPerformanceModel
 from tensor_cast.performance_model.op_invoke_info import OpInvokeInfo
-from tensor_cast.transformers.builtin_model.minimax_m3 import MiniMaxM3FusedMoETensorCast
+from tensor_cast.runtime import Runtime
+from tensor_cast.transformers.builtin_model.minimax_m3 import MiniMaxM3DenseMLPWrapper, MiniMaxM3FusedMoETensorCast
+
+
+class _FakeDenseMLP(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.swiglu_alpha = 1.702
+        self.swiglu_limit = 7.0
+        self.gate_up_proj = torch.nn.Linear(4, 8, bias=False)
+        self.down_proj = torch.nn.Linear(4, 4, bias=False)
 
 
 class _FakeEpGroup:
@@ -109,3 +121,17 @@ def test_minimax_m3_fused_moe_does_not_ep_all_reduce_like_deepseek():
 
     assert fused_moe.ep_group.all_reduce_calls == 0
     assert torch.equal(output, torch.full_like(hidden_states, 3.0))
+
+
+def test_minimax_m3_dense_mlp_wrapper_uses_m3_swiglu_quant():
+    wrapper = MiniMaxM3DenseMLPWrapper(_FakeDenseMLP()).to("meta")
+    hidden_states = torch.empty(2, 4, device="meta")
+
+    perf_model = AnalyticPerformanceModel(TEST_DEVICE)
+    with Runtime(perf_model, TEST_DEVICE) as runtime, torch.no_grad():
+        output = wrapper(hidden_states)
+
+    result = runtime.table_averages()
+    assert output.shape == hidden_states.shape
+    assert "tensor_cast.m3_swiglu_quant.default" in result
+    assert "aten.sigmoid.default" not in result

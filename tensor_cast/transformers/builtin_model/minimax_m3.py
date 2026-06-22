@@ -76,6 +76,27 @@ class _MoeReturnCompat(torch.nn.Module):
         return result, None
 
 
+class MiniMaxM3DenseMLPWrapper(torch.nn.Module):
+    def __init__(self, mlp, group_size: int = 128):
+        super().__init__()
+        self._inner = mlp
+        self.swiglu_alpha = mlp.swiglu_alpha
+        self.swiglu_limit = mlp.swiglu_limit
+        self.group_size = group_size
+
+    def forward(self, hidden_states):
+        gate_up = self._inner.gate_up_proj(hidden_states)
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden_states = torch.ops.tensor_cast.m3_swiglu_quant(
+            gate,
+            up,
+            self.swiglu_alpha,
+            self.swiglu_limit,
+            self.group_size,
+        )
+        return self._inner.down_proj(hidden_states)
+
+
 class MiniMaxM3MoELayer(MoELayer):
     def __init__(self, moe_config, module, quant_type):
         super().__init__(moe_config, module)
@@ -291,6 +312,15 @@ def _patch_m3_moe_return_compat(model):
         block_sparse_moe = getattr(layer, "block_sparse_moe", None)
         if block_sparse_moe is not None and not isinstance(block_sparse_moe, _MoeReturnCompat):
             layer.block_sparse_moe = _MoeReturnCompat(block_sparse_moe)
+    return model
+
+
+def patch_minimax_m3_dense_mlp(model: TransformerModel) -> TransformerModel:
+    for name, module in list(model._inner.named_modules()):
+        if isinstance(module, MiniMaxM3DenseMLPWrapper):
+            continue
+        if type(module).__name__ == "MiniMaxM3VLDenseMLP":
+            model._replace_module(name, MiniMaxM3DenseMLPWrapper(module))
     return model
 
 
@@ -627,6 +657,7 @@ def _(model: TransformerModel):
     model = patch_minimax_m3_layernorm(model)
     model = patch_apply_rotary_pos_emb_for_fused_rope(model)
     model = patch_attention(model)
+    model = patch_minimax_m3_dense_mlp(model)
     model = patch_moe(
         model,
         lambda moe_config, module: MiniMaxM3MoELayer(
