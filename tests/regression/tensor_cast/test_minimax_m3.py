@@ -2,14 +2,19 @@ import pytest
 import torch
 
 from tensor_cast.device import TEST_DEVICE
+from tensor_cast.layers.quant_linear import TensorCastQuantLinear
+from tensor_cast.model_config import QuantConfig
 from tensor_cast.performance_model.analytic import AnalyticPerformanceModel
 from tensor_cast.performance_model.op_invoke_info import OpInvokeInfo
+from tensor_cast.quantize_utils import LinearQuantType, QuantGranularity, QuantScheme, quantize_linear_modules
 from tensor_cast.runtime import Runtime
 from tensor_cast.transformers.builtin_model.minimax_m3 import (
     MiniMaxM3DenseMLPWrapper,
     MiniMaxM3FusedMoETensorCast,
+    MiniMaxM3MoeExpertMLP,
 )
-from tensor_cast.quantize_utils import LinearQuantType
+
+from .test_common import get_linear_quant_config
 
 
 class _FakeDenseMLP(torch.nn.Module):
@@ -21,14 +26,48 @@ class _FakeDenseMLP(torch.nn.Module):
         self.down_proj = torch.nn.Linear(4, 4, bias=False)
 
 
+class _FakeExpertsModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hidden_dim = 4
+        self.intermediate_dim = 4
+        self.swiglu_alpha = 1.702
+        self.swiglu_limit = 7.0
+        self.gate_up_proj = torch.nn.Parameter(torch.randn(1, 8, 4))
+        self.down_proj = torch.nn.Parameter(torch.randn(1, 4, 4))
+
+
 class _FakeEpGroup:
     def __init__(self, world_size):
         self.world_size = world_size
+        self.rank_in_group = 0
         self.all_reduce_calls = 0
 
     def all_reduce(self, input_):
         self.all_reduce_calls += 1
         return input_
+
+
+class _FakeExperts:
+    def call_expert(self, expert_idx, x, *args, **kwargs):
+        return x
+
+
+def _wrap_expert_fp8(expert: MiniMaxM3MoeExpertMLP) -> MiniMaxM3MoeExpertMLP:
+    quant_config = QuantConfig()
+    quant_config.linear_configs["*"] = get_linear_quant_config(
+        LinearQuantType.FP8,
+        dynamic_quant_granularity=QuantGranularity.PER_SAMPLE,
+        dynamic_quant_scheme=QuantScheme.SYMMETRIC,
+    )
+    quantize_linear_modules(
+        expert,
+        TensorCastQuantLinear,
+        quant_config,
+        default_config_name="default",
+        strip_module_fn=None,
+    )
+    return expert
 
 
 def test_minimax_indexer_op_registered():
@@ -109,7 +148,9 @@ def test_minimax_m3_fused_moe_does_not_ep_all_reduce_like_deepseek():
     fused_moe.routed_scaling_factor = 1.0
     fused_moe.shared_experts = torch.nn.Identity()
     fused_moe.num_external_shared_experts = 0
+    fused_moe._global_tp_size = 1
     fused_moe.ep_group = _FakeEpGroup(world_size=2)
+    fused_moe.experts = _FakeExperts()
 
     hidden_states = torch.ones(2, 4)
     topk_indices = torch.zeros(2, 1, dtype=torch.long)
@@ -117,7 +158,6 @@ def test_minimax_m3_fused_moe_does_not_ep_all_reduce_like_deepseek():
 
     fused_moe.get_split_sizes = lambda num_tokens, top_k: ([], [], [], [])
     fused_moe.dispatch_tokens = lambda hidden, indices, *_: [hidden]
-    fused_moe._run_routed_experts = lambda dispatched: dispatched
     fused_moe.combine_tokens = lambda routed, indices, *_: routed[0].unsqueeze(-2)
     fused_moe._run_shared_experts = lambda hidden: torch.full_like(hidden, 2.0)
 
@@ -141,58 +181,20 @@ def test_minimax_m3_dense_mlp_wrapper_uses_m3_swiglu_quant():
     assert "aten.sigmoid.default" not in result
 
 
-def test_minimax_m3_gate_up_quant_fuses_dispatched_experts():
-    fused_moe = MiniMaxM3FusedMoETensorCast.__new__(MiniMaxM3FusedMoETensorCast)
-    torch.nn.Module.__init__(fused_moe)
-    fused_moe.quant_type = LinearQuantType.FP8
-    fused_moe.swiglu_alpha = 1.702
-    fused_moe.swiglu_limit = 7.0
-    fused_moe._gate_up_weights = [
-        torch.empty(4, 8, device="meta"),
-        torch.empty(4, 8, device="meta"),
-        torch.empty(4, 8, device="meta"),
-    ]
-    fused_moe._gate_up_scales = [torch.ones((), device="meta")] * 3
-    fused_moe._down_weights = [
-        torch.empty(4, 4, device="meta"),
-        torch.empty(4, 4, device="meta"),
-        torch.empty(4, 4, device="meta"),
-    ]
-    fused_moe._down_scales = [torch.ones((), device="meta")] * 3
-
-    dispatched = [
-        torch.empty(2, 4, device="meta"),
-        torch.empty(0, 4, device="meta"),
-        torch.empty(1, 4, device="meta"),
-    ]
+def test_minimax_m3_moe_expert_uses_fp8_linear_for_gate_up_and_down():
+    expert = _wrap_expert_fp8(MiniMaxM3MoeExpertMLP(_FakeExpertsModule(), 0)).to("meta")
+    hidden_states = torch.empty(2, 4, device="meta")
 
     perf_model = AnalyticPerformanceModel(TEST_DEVICE)
     with Runtime(perf_model, TEST_DEVICE) as runtime, torch.no_grad():
-        fused_moe._run_routed_experts(dispatched)
+        output = expert(hidden_states)
 
     result = runtime.table_averages()
-    assert result.count("tensor_cast.dynamic_quantize_symmetric.default") == 1
-
-
-def test_minimax_m3_run_routed_experts_uses_grouped_matmul_fp8_twice():
-    fused_moe = MiniMaxM3FusedMoETensorCast.__new__(MiniMaxM3FusedMoETensorCast)
-    torch.nn.Module.__init__(fused_moe)
-    fused_moe.quant_type = LinearQuantType.FP8
-    fused_moe.swiglu_alpha = 1.702
-    fused_moe.swiglu_limit = 7.0
-    fused_moe._gate_up_weights = [torch.empty(4, 8, device="meta")]
-    fused_moe._gate_up_scales = [torch.ones((), device="meta")]
-    fused_moe._down_weights = [torch.empty(4, 4, device="meta")]
-    fused_moe._down_scales = [torch.ones((), device="meta")]
-
-    dispatched = [torch.empty(2, 4, device="meta")]
-
-    perf_model = AnalyticPerformanceModel(TEST_DEVICE)
-    with Runtime(perf_model, TEST_DEVICE) as runtime, torch.no_grad():
-        output = fused_moe._run_routed_experts(dispatched)
-
-    result = runtime.table_averages()
-    assert len(output) == 1
-    assert "tensor_cast.grouped_matmul_fp8.default" in result
-    assert "tensor_cast.dynamic_quantize_symmetric.default" in result
+    assert output.shape == hidden_states.shape
+    fp8_line = next(line for line in result.splitlines() if "tensor_cast.fp8_linear.default" in line)
+    quant_line = next(
+        line for line in result.splitlines() if "tensor_cast.dynamic_quantize_symmetric.default" in line
+    )
+    assert fp8_line.split()[-1] == "2"
+    assert quant_line.split()[-1] == "2"
     assert "tensor_cast.m3_swiglu_quant.default" in result
