@@ -23,45 +23,16 @@ from ..custom_model_registry import (
     register_model_profile,
 )
 from ..model import TransformerModel
-from ...layers.minimax_m3_attention import GemmaRMSNormFusedWrapper, MiniMaxM3AttentionWrapper, RMSNormFusedWrapper, _fused_decoder_layer_forward
+from ...layers.minimax_m3_attention import (
+    GemmaRMSNormFusedWrapper,
+    MiniMaxM3AttentionWrapper,
+    RMSNormFusedWrapper,
+    _fused_decoder_layer_forward,
+)
 
 logger = logging.getLogger(__name__)
 
 _EMPTY_VISUAL_LAYERS_ATTR = "_tensor_cast_empty_visual_layers"
-
-
-class MiniMaxM3ExpertMLP(torch.nn.Module):
-    """M3 Expert MLP using gate_proj + up_proj + down_proj with standard swiglu.
-
-    Forward uses silu(gate) * up (standard SwiGLU) instead of
-    SwigluOAIAndMul(cat([gate, up])), so that after quantization the DFC
-    (dispatch_ffn_combine) pass Case 2 can recognize:
-      static_quant_linear(gate) -> silu -> mul(up) -> static_quant_linear(down)
-    and fuse into a single dispatch_ffn_combine kernel.
-    """
-
-    def __init__(self, original_experts_module, expert_idx=None):
-        super().__init__()
-        if isinstance(original_experts_module, torch.nn.ModuleList) and expert_idx is None:
-            expert = original_experts_module[0]
-        elif expert_idx is not None:
-            expert = original_experts_module[expert_idx]
-        else:
-            expert = original_experts_module
-        self.hidden_size = expert.hidden_size
-        self.intermediate_size = expert.intermediate_size
-
-        self.gate_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = torch.nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-        with torch.no_grad():
-            self.gate_proj.weight.copy_(expert.gate_proj.weight.data)
-            self.up_proj.weight.copy_(expert.up_proj.weight.data)
-            self.down_proj.weight.copy_(expert.down_proj.weight.data)
-
-    def forward(self, hidden_states):
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
 class _MoeReturnCompat(torch.nn.Module):
@@ -208,8 +179,6 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
             )
         return torch.ops.tensor_cast.grouped_matmul(x, weights, bias)
 
-
-
     def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
         gate, up = gate_up.chunk(2, dim=-1)
         return torch.ops.tensor_cast.m3_swiglu(gate, up, self.swiglu_alpha, self.swiglu_limit)
@@ -267,6 +236,7 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
         )
 
         experts_hidden_states = self._run_routed_experts(dispatched_hidden_states)
+
         combined_hidden_states = self.combine_tokens(
             experts_hidden_states,
             expert_indices,
