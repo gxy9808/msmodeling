@@ -2348,36 +2348,27 @@ def _safe_tensor_int_list(values, fallback_total: int | None = None) -> list[int
 
 
 def _estimate_minimax_indexer_breakdown(
-    hidden_states: torch.Tensor,
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
     seq_lens: torch.Tensor,
     query_lens: torch.Tensor,
-    hidden_size: int,
-    num_indexer_heads: int,
-    indexer_head_dim: int,
-    indexer_rope_dim: int,
     topk_blocks: int,
     block_size: int,
 ):
     """Estimate FLOPs and memory bytes for minimax_indexer.
 
     Formula reference: M3-msmodeling.md section 4.1.
-    Variable naming: N = num_indexer_heads, D = indexer_head_dim, D_r = indexer_rope_dim.
+    Variable naming: N = num_indexer_heads, D = indexer_head_dim.
     """
-    T = math.prod(hidden_states.shape[:-1])
-    H = hidden_size
-    N = num_indexer_heads
-    D = indexer_head_dim
-    D_r = indexer_rope_dim
+    T = idx_q.shape[0]
+    N = idx_q.shape[1]
+    D = idx_q.shape[2]
     K = topk_blocks
     B_s = block_size
 
-    s = hidden_states.element_size()
+    s = idx_q.element_size()
 
     # --- MMA ---
-    # 4.1.1 Index Q/K Projection
-    index_q_proj_mma = 2 * T * H * N * D
-    index_k_proj_mma = 2 * T * H * N * D
-
     # 4.1.4 Index Block Score (QK^T scoring)
     # sum_b(Q_b * N * L_b * D) * 2
     Q_b_list = _safe_tensor_int_list(query_lens, fallback_total=T)
@@ -2392,10 +2383,6 @@ def _estimate_minimax_indexer_breakdown(
         sum_qb_nb_bn += Q_b * N * B_n
 
     # --- GP ---
-    # 4.1.2 Index Q/K Norm + RoPE
-    index_norm_gp = 12 * T * N * D
-    index_rope_gp = 6 * T * N * D_r
-
     # 4.1.4 Block reduce (score_type = max)
     block_reduce_gp = sum_qb_nb_lb
 
@@ -2403,18 +2390,11 @@ def _estimate_minimax_indexer_breakdown(
     c_topk = max(int(math.ceil(math.log2(max(K, 2)))), 1)
     topk_gp = c_topk * sum_qb_nb_bn
 
-    # --- Bytes ---
-    # 4.1.1 Index Q/K Projection
-    bytes_projection = 2 * T * H * s + 2 * H * N * D * s + 2 * T * N * D * s
-
-    # 4.1.2 Index Q/K Norm + RoPE
-    bytes_norm_rope = 4 * T * N * D * s + 4 * T * N * D * s + 2 * N * D * s
-
     # 4.1.3 Index K Cache Write
-    bytes_cache_write = 2 * T * N * D * s
+    bytes_cache_write = bytes_of_tensor(idx_k)
 
     # 4.1.4 Block Score
-    bytes_score = T * N * D * s
+    bytes_score = bytes_of_tensor(idx_q)
     for Q_b, L_b in zip(Q_b_list, L_b_list):
         B_n = math.ceil(L_b / B_s) if B_s > 0 else 0
         bytes_score += Q_b * N * L_b * D * s
@@ -2423,10 +2403,9 @@ def _estimate_minimax_indexer_breakdown(
     # 4.1.5 Top-k Selection
     bytes_topk = 4 * sum_qb_nb_bn + 4 * T * N * K
 
-    bytes_rope_only = 2 * T * N * D_r * s  # rope bytes only, norm bytes removed
-    mma_total = index_q_proj_mma + index_k_proj_mma + index_qk_mma
-    gp_total = block_reduce_gp + topk_gp  # index_norm_gp + index_rope_gp removed: now called as independent rms_norm and fused_rope
-    bytes_total = bytes_projection + bytes_cache_write + bytes_score + bytes_topk  # norm + rope bytes removed: now called as independent rms_norm and fused_rope
+    mma_total = index_qk_mma
+    gp_total = block_reduce_gp + topk_gp
+    bytes_total = bytes_cache_write + bytes_score + bytes_topk
 
     return {
         "mma_total": mma_total,
@@ -2439,7 +2418,6 @@ def _estimate_minimax_sparse_attention_breakdown(
     query: torch.Tensor,
     seq_lens: torch.Tensor,
     query_lens: torch.Tensor,
-    hidden_size: int,
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
@@ -2450,10 +2428,9 @@ def _estimate_minimax_sparse_attention_breakdown(
     """Estimate FLOPs and memory bytes for minimax_sparse_attention.
 
     Formula reference: M3-msmodeling.md section 4.2.
-    Boundary: hidden -> qkv_proj -> sparse attention -> o_proj -> output. (QK norm and RoPE are separate ops)
+    Boundary: sparse attention body. Q/K/V projection, QK norm, RoPE, cache write, and o_proj are separate ops.
     """
     T = math.prod(query.shape[:-1])
-    H = hidden_size
     N_q = num_q_heads
     N_kv = num_kv_heads
     D = head_dim
@@ -2462,19 +2439,6 @@ def _estimate_minimax_sparse_attention_breakdown(
     R = local_blocks
 
     s = query.element_size()
-
-    # --- QKV Projection ---
-    # qkv_proj: [T, H] @ [H, N_q*D + 2*N_kv*D] -> [T, N_q*D + 2*N_kv*D]
-    qkv_out_dim = N_q * D + 2 * N_kv * D
-    qkv_proj_mma = 2 * T * H * qkv_out_dim
-    qkv_proj_bytes = T * H * s + H * qkv_out_dim * s + T * qkv_out_dim * s
-
-    # --- QK Norm + RoPE ---
-    # Per-head RMSNorm on Q and K, then RoPE
-    qk_norm_gp = 12 * T * N_q * D + 12 * T * N_kv * D
-    qk_norm_bytes = 4 * T * N_q * D * s + 4 * T * N_kv * D * s
-    rope_gp = 6 * T * (N_q + N_kv) * D
-    rope_bytes = 2 * T * (N_q + N_kv) * D * s
 
     # --- Sparse Attention ---
     Q_b_list = _safe_tensor_int_list(query_lens, fallback_total=T)
@@ -2499,15 +2463,10 @@ def _estimate_minimax_sparse_attention_breakdown(
         # KV read: 2 * s * Q_b * A_b * N_kv * D
         kv_bytes += 2 * s * Q_b * A_b * N_kv * D
 
-    # --- O Projection ---
-    # o_proj: [T, N_q*D] @ [N_q*D, H] -> [T, H]
-    o_proj_mma = 2 * T * N_q * D * H
-    o_proj_bytes = T * N_q * D * s + N_q * D * H * s + T * H * s
-
     # --- Aggregate ---
-    mma_total = qkv_proj_mma + attn_mma + o_proj_mma
-    gp_total = attn_gp  # qk_norm_gp + rope_gp removed: now called as independent rms_norm and fused_rope
-    bytes_total = qkv_proj_bytes + qo_bytes + kv_bytes + topk_bytes + o_proj_bytes  # qk_norm + rope bytes removed: now called as independent rms_norm and fused_rope
+    mma_total = attn_mma
+    gp_total = attn_gp
+    bytes_total = qo_bytes + kv_bytes + topk_bytes
 
     return {
         "mma_total": mma_total,
@@ -2520,24 +2479,18 @@ def _estimate_minimax_sparse_attention_breakdown(
 def _(
     op_invoke_info: OpInvokeInfo,
 ) -> OpInvokeInfo.PerformanceProperties:
-    hidden_states = op_invoke_info.args[0]
-    seq_lens = op_invoke_info.args[1]
-    query_lens = op_invoke_info.args[2]
-    hidden_size = op_invoke_info.kwargs["hidden_size"]
-    num_indexer_heads = op_invoke_info.kwargs["num_indexer_heads"]
-    indexer_head_dim = op_invoke_info.kwargs["indexer_head_dim"]
-    indexer_rope_dim = op_invoke_info.kwargs["indexer_rope_dim"]
+    idx_q = op_invoke_info.args[0]
+    idx_k = op_invoke_info.args[1]
+    seq_lens = op_invoke_info.args[2]
+    query_lens = op_invoke_info.args[3]
     topk_blocks = op_invoke_info.kwargs["topk_blocks"]
     block_size = op_invoke_info.kwargs["block_size"]
 
     breakdown = _estimate_minimax_indexer_breakdown(
-        hidden_states,
+        idx_q,
+        idx_k,
         seq_lens,
         query_lens,
-        hidden_size,
-        num_indexer_heads,
-        indexer_head_dim,
-        indexer_rope_dim,
         topk_blocks,
         block_size,
     )
@@ -2545,7 +2498,7 @@ def _(
     properties = op_invoke_info.get_memory_access_properties()
     _accumulate_compute_ops(
         properties,
-        hidden_states.dtype,
+        idx_q.dtype,
         mma_ops=breakdown["mma_total"],
         gp_ops=breakdown["gp_total"],
     )
@@ -2560,7 +2513,6 @@ def _(
     query = op_invoke_info.args[0]
     seq_lens = op_invoke_info.args[4]
     query_lens = op_invoke_info.args[5]
-    hidden_size = op_invoke_info.kwargs["hidden_size"]
     num_q_heads = op_invoke_info.kwargs["num_q_heads"]
     num_kv_heads = op_invoke_info.kwargs["num_kv_heads"]
     head_dim = op_invoke_info.kwargs["head_dim"]
@@ -2572,7 +2524,6 @@ def _(
         query,
         seq_lens,
         query_lens,
-        hidden_size,
         num_q_heads,
         num_kv_heads,
         head_dim,

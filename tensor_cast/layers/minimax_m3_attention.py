@@ -80,17 +80,15 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
     Dense layers use the standard tensor_cast attention path (HF attention forward
     which calls q_proj, q_norm, fused_rope, attention, o_proj).
 
-    Sparse layers mirror the sglang NPU call chain:
-      1. q_proj, q_norm (rms_norm), fused_rope (InterleaveRope)
-      2. k_proj, k_norm (rms_norm)
-      3. index_q_proj, index_q_norm (rms_norm), fused_rope (InterleaveRope)
-      4. index_k_proj, index_k_norm (rms_norm)
-      5. minimax_indexer (index projection + block scoring + top-k)
-      6. minimax_sparse_attention (qkv_proj + sparse attn + o_proj)
+    Sparse layers mirror the upstream MiniMaxM3VLAttention path:
+      1. q_proj/k_proj/v_proj, q_norm/k_norm, fused_rope, cache write
+      2. indexer.q_proj/indexer.k_proj, indexer q/k norm, indexer fused_rope
+      3. minimax_indexer for block score/top-k selection
+      4. minimax_sparse_attention for sparse attention body
+      5. o_proj
 
-    Steps 1-4 produce separate rms_norm and fused_rope ops matching NPU profiling.
-    Steps 5-6 are fused ops whose performance estimates do NOT include RoPE or
-    QK norm (those are accounted for by the separate calls above).
+    Projection, norm, RoPE, cache, and o_proj are explicit ops. The two M3
+    virtual ops only model the sparse index selection and sparse attention body.
     """
 
     def __init__(
@@ -154,24 +152,15 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
         else:
             num_tokens = hidden_states.shape[0]
 
-        # --- Q/K norm (all 60 layers: separate rms_norm ops) ---
-        # In sglang: qkv_proj(hidden_states) -> split q,k,v -> _qk_norm(q, k)
-        # q_norm is per-head RMSNorm over head_dim, called on q reshaped to
-        # (num_tokens, num_heads, head_dim). rms_norm preserves input shape.
-        q_for_norm = hidden_states.new_empty(num_tokens, self.num_q_heads, self.head_dim)
-        k_for_norm = hidden_states.new_empty(num_tokens, self.num_kv_heads, self.head_dim)
-        q_normed = inner.q_norm(q_for_norm)
-        k_normed = inner.k_norm(k_for_norm)
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # --- Q/K fused_rope (all 60 layers: separate InterleaveRope ops) ---
-        # In sglang: self.rotary_emb(positions, q, k) -> fused_rope_qk_mqa
-        # fused_rope input: q (num_tokens, num_q_heads, head_dim),
-        #                   k (num_tokens, num_kv_heads, head_dim),
-        #                   cos_sin (num_tokens, rotary_dim * 2)
+        query_states = inner.q_norm(inner.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = inner.k_norm(inner.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = inner.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            q_3d = q_normed
-            k_3d = k_normed
             if cos.ndim == 3:
                 cos_flat = cos.reshape(num_tokens, cos.shape[-1])
                 sin_flat = sin.reshape(num_tokens, sin.shape[-1])
@@ -179,25 +168,20 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
                 cos_flat = cos.reshape(num_tokens, -1)
                 sin_flat = sin.reshape(num_tokens, -1)
             cos_sin = torch.cat([cos_flat, sin_flat], dim=-1)
-            q_rope, k_rope = torch.ops.tensor_cast.fused_rope(
-                q_3d, k_3d, cos_sin, self.rotary_dim, True
+            query_3d = query_states.transpose(1, 2).reshape(num_tokens, self.num_q_heads, self.head_dim)
+            key_3d = key_states.transpose(1, 2).reshape(num_tokens, self.num_kv_heads, self.head_dim)
+            query_3d, key_3d = torch.ops.tensor_cast.fused_rope(
+                query_3d, key_3d, cos_sin, self.rotary_dim, True
             )
+            query_states = query_3d.reshape(*input_shape, self.num_q_heads, self.head_dim).transpose(1, 2)
+            key_states = key_3d.reshape(*input_shape, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # --- Index Q/K norm (sparse layers only: separate rms_norm ops) ---
-        # In sglang: index_q_proj(hidden_states) -> _index_qk_norm(idx_q, idx_k)
-        # index_q_norm is per-head RMSNorm over indexer_head_dim.
         indexer = getattr(inner, "indexer", None)
         if indexer is not None:
-            idx_q_for_norm = hidden_states.new_empty(num_tokens, self.num_indexer_heads, self.indexer_head_dim)
-            idx_k_for_norm = hidden_states.new_empty(num_tokens, 1, self.indexer_head_dim)
-            idx_q_normed = indexer.q_norm(idx_q_for_norm)
-            idx_k_normed = indexer.k_norm(idx_k_for_norm)
+            idx_hidden_shape = (*input_shape, -1, self.indexer_head_dim)
+            idx_q_states = indexer.q_norm(indexer.q_proj(hidden_states).view(idx_hidden_shape)).transpose(1, 2)
+            idx_k_states = indexer.k_norm(indexer.k_proj(hidden_states).view(idx_hidden_shape)).transpose(1, 2)
 
-            # --- Index Q/K fused_rope (sparse layers only: separate InterleaveRope ops) ---
-            # In sglang: self.index_rotary_emb(positions, idx_q, idx_k) -> fused_rope_qk_mqa
-            # index_rotary_emb uses the same rotary_dim as the main rotary_emb.
-            # cos/sin have shape (batch, seq_len, rotary_dim), so cos_sin is
-            # (num_tokens, rotary_dim * 2).
             if position_embeddings is not None:
                 cos, sin = position_embeddings
                 if cos.ndim == 3:
@@ -207,35 +191,46 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
                     idx_cos = cos.reshape(num_tokens, -1)
                     idx_sin = sin.reshape(num_tokens, -1)
                 idx_cos_sin = torch.cat([idx_cos, idx_sin], dim=-1)
-                idx_q_3d = idx_q_normed
-                idx_k_3d = idx_k_normed
-                idx_q_rope, idx_k_rope = torch.ops.tensor_cast.fused_rope(
+                idx_q_3d = idx_q_states.transpose(1, 2).reshape(
+                    num_tokens, self.num_indexer_heads, self.indexer_head_dim
+                )
+                idx_k_3d = idx_k_states.transpose(1, 2).reshape(num_tokens, 1, self.indexer_head_dim)
+                idx_q_3d, idx_k_3d = torch.ops.tensor_cast.fused_rope(
                     idx_q_3d, idx_k_3d, idx_cos_sin, self.rotary_dim, True
                 )
+                idx_q_states = idx_q_3d.reshape(
+                    *input_shape, self.num_indexer_heads, self.indexer_head_dim
+                ).transpose(1, 2)
+                idx_k_states = idx_k_3d.reshape(*input_shape, 1, self.indexer_head_dim).transpose(1, 2)
+        else:
+            idx_q_states = hidden_states.new_empty(*input_shape, self.num_indexer_heads, self.indexer_head_dim)
+            idx_k_states = hidden_states.new_empty(*input_shape, 1, self.indexer_head_dim)
 
-        # --- Indexer (index projection + block scoring + top-k) ---
+        idx_q_flat = idx_q_states.transpose(1, 2).reshape(num_tokens, self.num_indexer_heads, self.indexer_head_dim)
+        idx_k_flat = idx_k_states.transpose(1, 2).reshape(num_tokens, 1, self.indexer_head_dim)
         topk_idx = torch.ops.tensor_cast.minimax_indexer(
-            hidden_states,
+            idx_q_flat,
+            idx_k_flat,
             seq_lens,
             query_lens,
             block_table,
-            hidden_size=self.hidden_size,
-            num_indexer_heads=self.num_indexer_heads,
-            indexer_head_dim=self.indexer_head_dim,
-            indexer_rope_dim=self.indexer_rope_dim,
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
         )
 
-        # --- Sparse Attention (qkv_proj + sparse attn + o_proj) ---
-        query = hidden_states
-        key_cache = kwargs.get("kv_cache", None)
-        if key_cache is not None and isinstance(key_cache, (list, tuple)):
-            key_cache_tensor = key_cache[0]
-            value_cache_tensor = key_cache[1]
+        query = query_states.transpose(1, 2).reshape(num_tokens, self.num_q_heads * self.head_dim)
+        key = key_states.transpose(1, 2).reshape(num_tokens, self.num_kv_heads * self.head_dim)
+        value = value_states.transpose(1, 2).reshape(num_tokens, self.num_kv_heads * self.head_dim)
+
+        kv_cache_by_layers = kwargs.get("kv_cache_by_layers", None)
+        kv_cache = kv_cache_by_layers.get(inner.layer_idx) if kv_cache_by_layers else None
+        if attention_meta is not None and kv_cache is not None:
+            torch.ops.tensor_cast.reshape_and_cache(key, value, kv_cache, attention_meta.slot_mapping)
+            key_cache_tensor = kv_cache[0]
+            value_cache_tensor = kv_cache[1]
         else:
-            key_cache_tensor = key_cache
-            value_cache_tensor = key_cache
+            key_cache_tensor = key
+            value_cache_tensor = value
 
         out = torch.ops.tensor_cast.minimax_sparse_attention(
             query,
@@ -254,4 +249,5 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
             local_blocks=self.local_blocks,
         )
 
-        return out, None
+        out = out.reshape(*input_shape, -1).contiguous()
+        return inner.o_proj(out), None

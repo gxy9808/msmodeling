@@ -260,12 +260,7 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
 
         if self.shared_experts and self.num_external_shared_experts == 0 and not skip_shared_experts:
             shared_output = self._run_shared_experts(hidden_states)
-            if self.ep_group.world_size > 1:
-                shared_output = self.ep_group.all_reduce(shared_output)
             final_hidden_states = final_hidden_states + shared_output
-
-        if self.ep_group.world_size > 1:
-            final_hidden_states = self.ep_group.all_reduce(final_hidden_states)
 
         return final_hidden_states.to(hidden_states.dtype)
 
@@ -409,8 +404,8 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
     if model.parallel_group_manager is not None and model.parallel_group_manager.tp_group is not None:
         tp_size = model.parallel_group_manager.tp_group.world_size
     per_rank_q_heads = num_q_heads // tp_size
-    per_rank_kv_heads = num_kv_heads // tp_size
-    per_rank_indexer_heads = num_indexer_heads // tp_size if num_indexer_heads >= tp_size else num_indexer_heads
+    per_rank_kv_heads = num_kv_heads // tp_size if num_kv_heads >= tp_size else 1
+    per_rank_indexer_heads = num_indexer_heads // tp_size if num_indexer_heads >= tp_size else 1
 
     unwrapped = model.unwrap()
     if not hasattr(unwrapped, "layers"):
