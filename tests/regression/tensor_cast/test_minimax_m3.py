@@ -1,6 +1,11 @@
 import pytest
 import torch
+from torch._inductor.compile_fx import fake_tensor_prop
 
+from tensor_cast import ops  # noqa: F401
+from tensor_cast.compilation.freezing_passes.grouped_matmul_swiglu_pass import GroupedMatmulSwigluPass
+from tensor_cast.compilation.freezing_passes.sink_split_pass import SinkSplitPass
+from tensor_cast.compilation.passes.merge_linear_pass import MergeLinearPass
 from tensor_cast.device import TEST_DEVICE
 from tensor_cast.layers.quant_linear import TensorCastQuantLinear
 from tensor_cast.model_config import QuantConfig
@@ -195,6 +200,72 @@ def test_minimax_m3_moe_expert_uses_fp8_linear_for_gate_up_and_down():
     quant_line = next(
         line for line in result.splitlines() if "tensor_cast.dynamic_quantize_symmetric.default" in line
     )
-    assert fp8_line.split()[-1] == "2"
-    assert quant_line.split()[-1] == "2"
+    assert fp8_line.split()[-1] == "3"
+    assert quant_line.split()[-1] == "3"
     assert "tensor_cast.m3_swiglu_quant.default" in result
+
+
+def _run_m3_moe_fp8_freezing_passes(gm: torch.fx.GraphModule, inputs):
+    fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
+    MergeLinearPass()(gm)
+    fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
+    for _ in range(3):
+        SinkSplitPass()(gm)
+        fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
+    GroupedMatmulSwigluPass()(gm)
+    fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
+    for _ in range(3):
+        SinkSplitPass()(gm)
+        fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
+
+
+def test_minimax_m3_moe_fp8_freezing_passes_fuse_gmm_swiglu_and_down():
+    """M3 expert graph should match DeepSeek: GMM+m3_swiglu_quant, then down GMM."""
+    dq = torch.ops.tensor_cast.dynamic_quantize_symmetric.default
+    fp8 = torch.ops.tensor_cast.fp8_linear.default
+    gmm = torch.ops.tensor_cast.grouped_matmul_fp8.default
+    gmm_m3 = torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default
+    m3sq = torch.ops.tensor_cast.m3_swiglu_quant.default
+    split = torch.ops.aten.split_with_sizes.default
+
+    def expert_fwd(x, wg, wu, wd, wsg, wsu, wsd):
+        qx, ascale = dq(x, dims=[-1], scale_dtype=torch.float32, out_dtype=torch.int8)
+        gate = fp8(qx, wg, ascale, wsg, None, torch.bfloat16)
+        up = fp8(qx, wu, ascale, wsu, None, torch.bfloat16)
+        mid = m3sq(gate, up, 1.702, 7.0, 128)
+        qm, mscale = dq(mid, dims=[-1], scale_dtype=torch.float32, out_dtype=torch.int8)
+        return fp8(qm, wd, mscale, wsd, None, torch.bfloat16)
+
+    class _TwoExpertMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for i in (0, 1):
+                for name, shape in (
+                    ("wg", (4, 4)),
+                    ("wu", (4, 4)),
+                    ("wd", (4, 4)),
+                    ("wsg", (4,)),
+                    ("wsu", (4,)),
+                    ("wsd", (4,)),
+                ):
+                    param = torch.randn(shape) if len(shape) > 1 else torch.ones(shape)
+                    setattr(self, f"{name}{i}", torch.nn.Parameter(param))
+
+        def forward(self, x):
+            cat = torch.cat([x[:3], x[3:]], dim=0)
+            x0, x1 = split(cat, [3, 2], 0)
+            o0 = expert_fwd(x0, self.wg0, self.wu0, self.wd0, self.wsg0, self.wsu0, self.wsd0)
+            o1 = expert_fwd(x1, self.wg1, self.wu1, self.wd1, self.wsg1, self.wsu1, self.wsd1)
+            return torch.cat([o0, o1], dim=0)
+
+    inputs = [torch.empty(5, 4)]
+    gm = torch.fx.symbolic_trace(_TwoExpertMoE())
+    _run_m3_moe_fp8_freezing_passes(gm, inputs)
+
+    def _count(target):
+        return sum(1 for node in gm.graph.nodes if node.target == target)
+
+    assert _count(fp8) == 0
+    assert _count(m3sq) == 0
+    assert _count(gmm_m3) == 1
+    assert _count(gmm) == 1

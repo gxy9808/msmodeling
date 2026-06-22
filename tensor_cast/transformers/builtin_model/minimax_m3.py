@@ -35,7 +35,12 @@ _M3_MXFP8_GROUP_SIZE = 128
 
 
 class MiniMaxM3MoeExpertMLP(torch.nn.Module):
-    """Per-expert MLP with fused gate_up_proj; quant via TensorCastQuantLinear after patch."""
+    """Per-expert MLP aligned with ``MoeExpertMLP`` (DeepSeek path).
+
+    We never run fused ``gate_up_proj`` + ``chunk`` in forward: compile passes expect
+    separate ``gate_proj`` / ``up_proj`` sharing the same hidden states. Fused checkpoint
+    weights are split once at init (dim=0), same as ``custom_model_registry.MoeExpertMLP``.
+    """
 
     def __init__(
         self,
@@ -51,16 +56,20 @@ class MiniMaxM3MoeExpertMLP(torch.nn.Module):
 
         hidden_dim = original_experts_module.hidden_dim
         intermediate_dim = original_experts_module.intermediate_dim
-        self.gate_up_proj = torch.nn.Linear(hidden_dim, 2 * intermediate_dim, bias=False)
+        self.gate_proj = torch.nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.up_proj = torch.nn.Linear(hidden_dim, intermediate_dim, bias=False)
         self.down_proj = torch.nn.Linear(intermediate_dim, hidden_dim, bias=False)
 
         with torch.no_grad():
-            self.gate_up_proj.weight.copy_(original_experts_module.gate_up_proj.data[expert_idx])
+            gate_up_weight = original_experts_module.gate_up_proj.data[expert_idx]
+            gate_weight, up_weight = gate_up_weight.chunk(2, dim=0)
+            self.gate_proj.weight.copy_(gate_weight)
+            self.up_proj.weight.copy_(up_weight)
             self.down_proj.weight.copy_(original_experts_module.down_proj.data[expert_idx])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(hidden_states)
-        gate, up = gate_up.chunk(2, dim=-1)
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
         hidden_states = torch.ops.tensor_cast.m3_swiglu_quant(
             gate,
             up,
@@ -84,16 +93,28 @@ class _MoeReturnCompat(torch.nn.Module):
 
 
 class MiniMaxM3DenseMLPWrapper(torch.nn.Module):
+    """Dense FFN wrapper: gate/up linears like ``MoeExpertMLP``, then ``m3_swiglu_quant``."""
+
     def __init__(self, mlp, group_size: int = 128):
         super().__init__()
-        self._inner = mlp
         self.swiglu_alpha = mlp.swiglu_alpha
         self.swiglu_limit = mlp.swiglu_limit
         self.group_size = group_size
 
+        hidden_dim = mlp.gate_up_proj.in_features
+        intermediate_dim = mlp.gate_up_proj.out_features // 2
+        self.gate_proj = torch.nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.up_proj = torch.nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.down_proj = mlp.down_proj
+
+        with torch.no_grad():
+            gate_weight, up_weight = mlp.gate_up_proj.weight.chunk(2, dim=0)
+            self.gate_proj.weight.copy_(gate_weight)
+            self.up_proj.weight.copy_(up_weight)
+
     def forward(self, hidden_states):
-        gate_up = self._inner.gate_up_proj(hidden_states)
-        gate, up = gate_up.chunk(2, dim=-1)
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
         hidden_states = torch.ops.tensor_cast.m3_swiglu_quant(
             gate,
             up,
@@ -101,7 +122,7 @@ class MiniMaxM3DenseMLPWrapper(torch.nn.Module):
             self.swiglu_limit,
             self.group_size,
         )
-        return self._inner.down_proj(hidden_states)
+        return self.down_proj(hidden_states)
 
 
 class MiniMaxM3MoELayer(MoELayer):

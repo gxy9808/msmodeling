@@ -56,6 +56,8 @@ class GroupedMatmulSwigluPass(TensorCastGraphModulePass):
 
             is_m3 = node.target == torch.ops.tensor_cast.m3_swiglu.default
             is_m3_quant = node.target == torch.ops.tensor_cast.m3_swiglu_quant.default
+            # m3_swiglu_quant must also be registered in SinkSplitPass binary_ops so gate/up
+            # stay on one split after GMM sink; otherwise this pass never matches.
 
             if is_m3_quant:
                 op_map = self._m3_quant_op_map
