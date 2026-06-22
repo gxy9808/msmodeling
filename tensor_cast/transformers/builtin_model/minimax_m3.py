@@ -162,22 +162,89 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
             self._gate_up_scales = None
             self._down_scales = None
 
+    @staticmethod
+    def _unit_activation_scale(x: torch.Tensor) -> torch.Tensor:
+        return torch.ones((), device=x.device, dtype=torch.float32)
+
+    def _quantize_grouped_inputs(self, x_list: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Quantize dispatched expert inputs with one kernel, matching DeepSeek's pattern.
+
+        DeepSeek defers activation quant to ``fp8_linear`` and, after compile, lifts a single
+        ``dynamic_quantize`` onto the shared buffer before expert ``split``. Expert tensors here
+        are slices of the same routed hidden buffer, so per-token ``dims=[-1]`` quant commutes
+        with ``cat`` / ``split``.
+        """
+        if not x_list:
+            return [], []
+
+        token_sizes = [x.shape[0] for x in x_list]
+        non_empty = [(idx, x) for idx, x in enumerate(x_list) if x.numel() > 0]
+        if not non_empty:
+            return x_list, [self._unit_activation_scale(x) for x in x_list]
+
+        x_cat = torch.cat([x for _, x in non_empty], dim=0)
+        x_q_cat, scale_cat = torch.ops.tensor_cast.dynamic_quantize_symmetric(
+            x_cat,
+            dims=[-1],
+            scale_dtype=torch.float32,
+            out_dtype=torch.int8,
+        )
+        non_empty_sizes = [x.shape[0] for _, x in non_empty]
+        x_q_chunks = list(torch.split(x_q_cat, non_empty_sizes, dim=0))
+        scale_chunks = list(torch.split(scale_cat, non_empty_sizes, dim=0))
+
+        x_q: list[torch.Tensor] = []
+        x_scales: list[torch.Tensor] = []
+        chunk_idx = 0
+        for idx, x in enumerate(x_list):
+            if token_sizes[idx] == 0:
+                x_q.append(x)
+                x_scales.append(self._unit_activation_scale(x))
+                continue
+            x_q.append(x_q_chunks[chunk_idx])
+            x_scales.append(scale_chunks[chunk_idx])
+            chunk_idx += 1
+        return x_q, x_scales
+
+    def _grouped_matmul_fp8(
+        self,
+        x: list[torch.Tensor],
+        weights: list[torch.Tensor],
+        weight_scales: list[torch.Tensor] | None,
+        *,
+        quantize_inputs: bool,
+    ) -> torch.Tensor:
+        bias = self._bias_list(len(weights))
+        if quantize_inputs:
+            x_q, x_scales = self._quantize_grouped_inputs(x)
+        else:
+            x_q = x
+            x_scales = self._scale_list(x)
+        return torch.ops.tensor_cast.grouped_matmul_fp8(
+            x_q,
+            weights,
+            weight_scales,
+            x_scales,
+            bias,
+            out_dtype=torch.bfloat16,
+        )
+
     def _grouped_matmul(
         self,
         x: list[torch.Tensor],
         weights: list[torch.Tensor],
         weight_scales: list[torch.Tensor] | None,
+        *,
+        quantize_inputs: bool = False,
     ) -> torch.Tensor:
-        bias = self._bias_list(len(weights))
         if self.quant_type == LinearQuantType.FP8:
-            return torch.ops.tensor_cast.grouped_matmul_fp8_bf16(
+            return self._grouped_matmul_fp8(
                 x,
                 weights,
                 weight_scales,
-                bias,
-                out_dtype=x[0].dtype if x else torch.bfloat16,
+                quantize_inputs=quantize_inputs,
             )
-        return torch.ops.tensor_cast.grouped_matmul(x, weights, bias)
+        return torch.ops.tensor_cast.grouped_matmul(x, weights, self._bias_list(len(weights)))
 
     def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
         gate, up = gate_up.chunk(2, dim=-1)
@@ -187,27 +254,22 @@ class MiniMaxM3FusedMoETensorCast(FusedMoETensorCast):
         gate, up = gate_up.chunk(2, dim=-1)
         return torch.ops.tensor_cast.m3_swiglu_quant(gate, up, self.swiglu_alpha, self.swiglu_limit, group_size)
 
-    def _grouped_matmul_with_prequant(
-        self,
-        x: list[torch.Tensor],
-        weights: list[torch.Tensor],
-        weight_scales: list[torch.Tensor] | None,
-    ) -> torch.Tensor:
-        bias = self._bias_list(len(weights))
-        return torch.ops.tensor_cast.grouped_matmul_fp8_bf16(
-            x,
-            weights,
-            weight_scales,
-            bias,
-            out_dtype=torch.bfloat16,
-        )
-
     def _run_routed_experts(self, dispatched_hidden_states: list[torch.Tensor]) -> list[torch.Tensor]:
-        gate_up = self._grouped_matmul(dispatched_hidden_states, self._gate_up_weights, self._gate_up_scales)
+        gate_up = self._grouped_matmul(
+            dispatched_hidden_states,
+            self._gate_up_weights,
+            self._gate_up_scales,
+            quantize_inputs=True,
+        )
         if self.quant_type == LinearQuantType.FP8:
             activated = self._apply_gate_quant(gate_up)
             activated_by_expert = self._split_by_inputs(activated, dispatched_hidden_states)
-            down = self._grouped_matmul_with_prequant(activated_by_expert, self._down_weights, self._down_scales)
+            down = self._grouped_matmul(
+                activated_by_expert,
+                self._down_weights,
+                self._down_scales,
+                quantize_inputs=False,
+            )
         else:
             activated = self._apply_gate(gate_up)
             activated_by_expert = self._split_by_inputs(activated, dispatched_hidden_states)

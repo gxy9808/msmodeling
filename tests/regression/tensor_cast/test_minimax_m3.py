@@ -141,7 +141,40 @@ def test_minimax_m3_dense_mlp_wrapper_uses_m3_swiglu_quant():
     assert "aten.sigmoid.default" not in result
 
 
-def test_minimax_m3_run_routed_experts_uses_grouped_matmul_fp8_bf16_twice():
+def test_minimax_m3_gate_up_quant_fuses_dispatched_experts():
+    fused_moe = MiniMaxM3FusedMoETensorCast.__new__(MiniMaxM3FusedMoETensorCast)
+    torch.nn.Module.__init__(fused_moe)
+    fused_moe.quant_type = LinearQuantType.FP8
+    fused_moe.swiglu_alpha = 1.702
+    fused_moe.swiglu_limit = 7.0
+    fused_moe._gate_up_weights = [
+        torch.empty(4, 8, device="meta"),
+        torch.empty(4, 8, device="meta"),
+        torch.empty(4, 8, device="meta"),
+    ]
+    fused_moe._gate_up_scales = [torch.ones((), device="meta")] * 3
+    fused_moe._down_weights = [
+        torch.empty(4, 4, device="meta"),
+        torch.empty(4, 4, device="meta"),
+        torch.empty(4, 4, device="meta"),
+    ]
+    fused_moe._down_scales = [torch.ones((), device="meta")] * 3
+
+    dispatched = [
+        torch.empty(2, 4, device="meta"),
+        torch.empty(0, 4, device="meta"),
+        torch.empty(1, 4, device="meta"),
+    ]
+
+    perf_model = AnalyticPerformanceModel(TEST_DEVICE)
+    with Runtime(perf_model, TEST_DEVICE) as runtime, torch.no_grad():
+        fused_moe._run_routed_experts(dispatched)
+
+    result = runtime.table_averages()
+    assert result.count("tensor_cast.dynamic_quantize_symmetric.default") == 1
+
+
+def test_minimax_m3_run_routed_experts_uses_grouped_matmul_fp8_twice():
     fused_moe = MiniMaxM3FusedMoETensorCast.__new__(MiniMaxM3FusedMoETensorCast)
     torch.nn.Module.__init__(fused_moe)
     fused_moe.quant_type = LinearQuantType.FP8
@@ -160,5 +193,6 @@ def test_minimax_m3_run_routed_experts_uses_grouped_matmul_fp8_bf16_twice():
 
     result = runtime.table_averages()
     assert len(output) == 1
-    assert "tensor_cast.grouped_matmul_fp8_bf16.default" in result
+    assert "tensor_cast.grouped_matmul_fp8.default" in result
+    assert "tensor_cast.dynamic_quantize_symmetric.default" in result
     assert "tensor_cast.m3_swiglu_quant.default" in result

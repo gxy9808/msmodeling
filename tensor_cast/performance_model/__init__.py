@@ -1177,23 +1177,6 @@ def _(
     return properties
 
 
-@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.grouped_matmul_fp8_bf16.default)
-@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.grouped_matmul_mxfp4_bf16.default)
-def _(
-    op_invoke_info: OpInvokeInfo,
-) -> OpInvokeInfo.PerformanceProperties:
-    assert len(op_invoke_info.args) == 5
-    x = op_invoke_info.args[0]
-    w = op_invoke_info.args[1]
-    bias = op_invoke_info.args[3]
-    assert len(x) == len(w) == len(bias)
-    properties = op_invoke_info.get_memory_access_properties()
-    for xi, wi, biasi in zip(x, w, bias):
-        properties_i = _static_quant_linear_properties_helper(op_invoke_info, xi, wi, None, biasi, is_int4=False)
-        properties.combine(properties_i, compute_only=True)
-    return properties
-
-
 def _swiglu_fusion_properties_helper(
     op_invoke_info: OpInvokeInfo,
     x: List[torch.Tensor],

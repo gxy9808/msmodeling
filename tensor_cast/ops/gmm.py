@@ -194,17 +194,3 @@ def _(
     return torch.empty(swiglu_out_shape, dtype=out_dtype, device="meta")
 
 
-@register_tensor_cast_op("grouped_matmul_fp8_bf16")
-@register_tensor_cast_op("grouped_matmul_mxfp4_bf16")
-def _(
-    x: List[torch.Tensor],
-    w: List[torch.Tensor],
-    w_scale: List[torch.Tensor],
-    bias: List[Optional[torch.Tensor]],
-    out_dtype: Optional[torch.dtype],
-) -> torch.Tensor:
-    if out_dtype is None:
-        out_dtype = x[0].dtype if x else torch.float32
-    M = sum(xi.shape[0] for xi in x)
-    N = w[0].shape[1] if w else 0
-    return torch.empty((M, N), dtype=out_dtype, device="meta")
