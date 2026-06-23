@@ -15,6 +15,7 @@ from . import patterns
 from .constant_folding import fold_meta_constants
 from .freezing_passes import patterns as freezing_patterns
 from .freezing_passes.dispatch_ffn_combine_pass import DispatchFFNCombinePass
+from .freezing_passes.fuse_m3_swiglu_quant_pass import FuseM3SwigluQuantPass
 from .freezing_passes.grouped_matmul_swiglu_pass import GroupedMatmulSwigluPass
 from .freezing_passes.fused_rope_pass import FusedRopePass
 from .freezing_passes.sink_split_pass import SinkSplitPass
@@ -236,6 +237,8 @@ class CompilerBackend:
             # TODO(jgong): make sure the sink split pass is correct by shape propagation
             #              since explicitly adding shape info might be expensive
             fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
+        GraphTransformObserver(gm, "fuse_m3_swiglu_quant_pass").apply_gm_pass(FuseM3SwigluQuantPass())
+        fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
         if config.compilation.fusion_patterns.enable_matmul_allreduce:
             self.apply_freezing_pattern_passes(gm, inputs)
         if config.compilation.fusion_patterns.enable_grouped_matmul_swiglu:

@@ -1253,6 +1253,44 @@ def _swiglu_fusion_properties_helper(
     return properties
 
 
+def _symmetric_quant_scale_shape(x_shape: torch.Size, dims: list[int]) -> torch.Size:
+    if not dims:
+        return torch.Size([])
+    scale_shape = list(x_shape)
+    for dim in dims:
+        scale_shape[dim] = 1
+    return torch.Size(scale_shape)
+
+
+def _m3_swiglu_quant_properties_helper(op_invoke_info: OpInvokeInfo) -> OpInvokeInfo.PerformanceProperties:
+    """Model fused M3 SwiGLU + post activation quant (silu_and_mul_post_quant)."""
+    gate = op_invoke_info.args[0]
+    dtype = gate.dtype
+    properties = op_invoke_info.get_memory_access_properties()
+
+    n = gate.shape[-1] if gate.ndim > 0 else 0
+    m = gate.numel() // n if n > 0 else 0
+    _accumulate_compute_ops(properties, dtype, gp_ops=m * n * 7)
+
+    scale_shape = _symmetric_quant_scale_shape(gate.shape, [-1])
+    quant_info = OpInvokeInfo(
+        torch.ops.tensor_cast.dynamic_quantize_symmetric.default,
+        (gate, [-1]),
+        {"scale_dtype": torch.float32, "out_dtype": torch.int8},
+        (
+            torch.empty(gate.shape, dtype=torch.int8, device=gate.device),
+            torch.empty(scale_shape, dtype=torch.float32, device=gate.device),
+        ),
+    )
+    properties.combine(quant_info.get_memory_access_properties())
+    return properties
+
+
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.m3_swiglu_quant.default)
+def _(op_invoke_info: OpInvokeInfo) -> OpInvokeInfo.PerformanceProperties:
+    return _m3_swiglu_quant_properties_helper(op_invoke_info)
+
+
 @OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.grouped_matmul_swiglu.default)
 def _(op_invoke_info: OpInvokeInfo) -> OpInvokeInfo.PerformanceProperties:
     # Args: (x, w, bias)

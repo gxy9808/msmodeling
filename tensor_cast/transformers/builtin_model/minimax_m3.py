@@ -27,6 +27,7 @@ from ...layers.minimax_m3_attention import (
     RMSNormFusedWrapper,
     _fused_decoder_layer_forward,
 )
+from ...layers.quant_linear import TensorCastQuantLinear
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +71,16 @@ class MiniMaxM3MoeExpertMLP(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(hidden_states)
         up = self.up_proj(hidden_states)
-        hidden_states = torch.ops.tensor_cast.m3_swiglu_quant(
-            gate,
-            up,
-            self.swiglu_alpha,
-            self.swiglu_limit,
-            self.group_size,
-        )
+        if isinstance(self.down_proj, TensorCastQuantLinear):
+            hidden_states, activation_scale = torch.ops.tensor_cast.m3_swiglu_quant(
+                gate,
+                up,
+                self.swiglu_alpha,
+                self.swiglu_limit,
+                self.group_size,
+            )
+            return self.down_proj(hidden_states, activation_scale=activation_scale)
+        hidden_states = torch.ops.tensor_cast.m3_swiglu(gate, up, self.swiglu_alpha, self.swiglu_limit)
         return self.down_proj(hidden_states)
 
 
@@ -115,13 +119,16 @@ class MiniMaxM3DenseMLPWrapper(torch.nn.Module):
     def forward(self, hidden_states):
         gate = self.gate_proj(hidden_states)
         up = self.up_proj(hidden_states)
-        hidden_states = torch.ops.tensor_cast.m3_swiglu_quant(
-            gate,
-            up,
-            self.swiglu_alpha,
-            self.swiglu_limit,
-            self.group_size,
-        )
+        if isinstance(self.down_proj, TensorCastQuantLinear):
+            hidden_states, activation_scale = torch.ops.tensor_cast.m3_swiglu_quant(
+                gate,
+                up,
+                self.swiglu_alpha,
+                self.swiglu_limit,
+                self.group_size,
+            )
+            return self.down_proj(hidden_states, activation_scale=activation_scale)
+        hidden_states = torch.ops.tensor_cast.m3_swiglu(gate, up, self.swiglu_alpha, self.swiglu_limit)
         return self.down_proj(hidden_states)
 
 

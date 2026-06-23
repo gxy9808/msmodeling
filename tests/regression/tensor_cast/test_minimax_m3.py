@@ -174,6 +174,13 @@ def test_minimax_m3_fused_moe_does_not_ep_all_reduce_like_deepseek():
 
 def test_minimax_m3_dense_mlp_wrapper_uses_m3_swiglu_quant():
     wrapper = MiniMaxM3DenseMLPWrapper(_FakeDenseMLP()).to("meta")
+    quantize_linear_modules(
+        wrapper,
+        TensorCastQuantLinear,
+        QuantConfig(linear_configs={"*": get_linear_quant_config(LinearQuantType.FP8)}),
+        default_config_name="default",
+        strip_module_fn=None,
+    )
     hidden_states = torch.empty(2, 4, device="meta")
 
     perf_model = AnalyticPerformanceModel(TEST_DEVICE)
@@ -201,7 +208,7 @@ def test_minimax_m3_moe_expert_uses_fp8_linear_for_gate_up_and_down():
         line for line in result.splitlines() if "tensor_cast.dynamic_quantize_symmetric.default" in line
     )
     assert fp8_line.split()[-1] == "3"
-    assert quant_line.split()[-1] == "3"
+    assert quant_line.split()[-1] == "2"
     assert "tensor_cast.m3_swiglu_quant.default" in result
 
 
@@ -213,10 +220,8 @@ def _run_m3_moe_fp8_freezing_passes(gm: torch.fx.GraphModule, inputs):
         SinkSplitPass()(gm)
         fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
     GroupedMatmulSwigluPass()(gm)
-    fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
     for _ in range(3):
         SinkSplitPass()(gm)
-        fake_tensor_prop(gm, inputs, force_allow_non_fake_inputs=True)
 
 
 def test_minimax_m3_moe_fp8_freezing_passes_fuse_gmm_swiglu_and_down():
@@ -232,9 +237,8 @@ def test_minimax_m3_moe_fp8_freezing_passes_fuse_gmm_swiglu_and_down():
         qx, ascale = dq(x, dims=[-1], scale_dtype=torch.float32, out_dtype=torch.int8)
         gate = fp8(qx, wg, ascale, wsg, None, torch.bfloat16)
         up = fp8(qx, wu, ascale, wsu, None, torch.bfloat16)
-        mid = m3sq(gate, up, 1.702, 7.0, 128)
-        qm, mscale = dq(mid, dims=[-1], scale_dtype=torch.float32, out_dtype=torch.int8)
-        return fp8(qm, wd, mscale, wsd, None, torch.bfloat16)
+        mid, mscale = m3sq(gate, up, 1.702, 7.0, 128)
+        return fp8(mid, wd, mscale, wsd, None, torch.bfloat16)
 
     class _TwoExpertMoE(torch.nn.Module):
         def __init__(self):
