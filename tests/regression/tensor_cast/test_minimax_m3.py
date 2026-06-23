@@ -8,8 +8,10 @@ from tensor_cast.compilation.passes.merge_linear_pass import MergeLinearPass
 from tensor_cast.device import TEST_DEVICE
 from tensor_cast.layers.quant_linear import TensorCastQuantLinear
 from tensor_cast.model_config import QuantConfig
+from tensor_cast.performance_model import _estimate_minimax_indexer_breakdown
 from tensor_cast.performance_model.analytic import AnalyticPerformanceModel
 from tensor_cast.performance_model.op_invoke_info import OpInvokeInfo
+from tensor_cast.performance_model.utils import bytes_of_tensor
 from tensor_cast.quantize_utils import LinearQuantType, QuantGranularity, QuantScheme, quantize_linear_modules
 from tensor_cast.runtime import Runtime
 from tensor_cast.transformers.builtin_model.minimax_m3 import (
@@ -111,8 +113,6 @@ def test_minimax_indexer_k_cache_read_uses_block_size_q():
     kernel tiles queries into BLOCK_SIZE_Q=64 and reuses each K-block across the
     tile via tl.dot(q, k).
     """
-    from tensor_cast.performance_model import _estimate_minimax_indexer_breakdown
-
     # Q_b=64, L_b=128, N=1, D=128, K=16, B_s=128, bf16 (s=2)
     # Naive (old): 64*1*128*128*2 = 2_097_152 bytes for K read alone
     # vLLM kernel: K read once per B_q=64 query tile -> 2_097_152 / 64 = 32_768 bytes
@@ -132,6 +132,43 @@ def test_minimax_indexer_k_cache_read_uses_block_size_q():
     # If the formula is wrong (no /64), bytes_total would be > 2 MB.
     # Correct formula gives ~32 KB for K read plus a few KB for score writes.
     assert bd["bytes_total"] < 100_000, f"K-cache read not divided by BLOCK_SIZE_Q=64; bytes_total={bd['bytes_total']}"
+
+
+def _total_memory_bytes(properties: OpInvokeInfo.PerformanceProperties) -> int:
+    return properties.memory_read_bytes + properties.memory_write_bytes + properties.memory_readwrite_bytes
+
+
+def test_minimax_indexer_no_double_count_input_tensors():
+    """Registered minimax_indexer must not auto-count idx_q/idx_k on top of breakdown."""
+    t, num_heads, head_dim, topk_blocks, block_size = 64, 1, 128, 16, 128
+    idx_q = torch.empty(t, num_heads, head_dim, device="meta", dtype=torch.bfloat16)
+    idx_k = torch.empty(t, 1, head_dim, device="meta", dtype=torch.bfloat16)
+    seq_lens = torch.tensor([128])
+    query_lens = torch.tensor([64])
+    block_table = torch.empty(1, 32, device="meta", dtype=torch.long)
+    topk_out = torch.empty(t, num_heads, topk_blocks, device="meta", dtype=torch.int32)
+
+    op = OpInvokeInfo(
+        torch.ops.tensor_cast.minimax_indexer.default,
+        (idx_q, idx_k, seq_lens, query_lens, block_table),
+        {"topk_blocks": topk_blocks, "block_size": block_size},
+        topk_out,
+    )
+    breakdown = _estimate_minimax_indexer_breakdown(
+        idx_q,
+        idx_k,
+        seq_lens,
+        query_lens,
+        topk_blocks=topk_blocks,
+        block_size=block_size,
+    )
+    auto_excluded = op.get_memory_access_properties(exclude_input_ids={0, 1})
+    auto_included = op.get_memory_access_properties()
+    props = op.get_perf_properties()
+
+    input_tensor_bytes = bytes_of_tensor(idx_q) + bytes_of_tensor(idx_k)
+    assert _total_memory_bytes(auto_included) >= _total_memory_bytes(auto_excluded) + input_tensor_bytes
+    assert _total_memory_bytes(props) == _total_memory_bytes(auto_excluded) + breakdown["bytes_total"]
 
 
 def test_minimax_sparse_attention_meta_shape():

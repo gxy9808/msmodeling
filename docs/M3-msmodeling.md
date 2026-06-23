@@ -262,7 +262,7 @@ $$
 
 #### 4.1.4 Index Block Score
 
-对应 SGLang sparse backend 中`flash_*_with_topk_idx` 的 score 部分： `idx_q` 与 index K cache 打分，然后按`sparse_block_size` 聚合到 block score。 index Q/K 都有 $N$ 个 head，打分时按 indexer head 对齐。
+对应 vLLM 中 `_index_block_score_kernel`（`vllm/models/minimax_m3/common/ops/index_topk.py`）的 score 部分：`idx_q` 与 index K cache 打分，然后按 `sparse_block_size` 聚合到 block score。index Q/K 都有 $N$ 个 head，打分时按 indexer head 对齐。
 
 计算量按 request 求和：
 
@@ -284,16 +284,14 @@ $$
 \begin{aligned}
 \mathrm{read\_idx\_q\_bytes}
   &= TNDs \\
-\mathrm{read\_idx\_k\_cache\_bytes}^{\mathrm{lower}}
-  &= \sum_b Q_bNL_bDs \\
-\mathrm{read\_idx\_k\_cache\_bytes}^{\mathrm{upper}}
-  &= \sum_b Q_bNL_bDs \\
+\mathrm{read\_idx\_k\_cache\_bytes}
+  &= \sum_b \frac{Q_b}{B_q} N L_b D s \\
 \mathrm{write\_score\_bytes}
   &= 4\sum_b Q_bNB_n
 \end{aligned}
 $$
 
-index K cache 同样按 $N$ 个 head 存储，因此这里的 lower/upper 先按相同逻辑访问量处理；若 kernel 后续能证明跨 query token 或 block 有额外复用， 再通过 profiling 调整。
+其中 $B_q = 64$ 是kernel中Q的tile大小：key cache被加载一次后被 $B_q$ 个 query token 共享，因此 K cache 读量按 query tile 数 $\lceil Q_b / B_q \rceil$ 而非 query token 数计；近似写成 $Q_b / B_q$。
 
 #### 4.1.5 Top-k Selection
 
@@ -364,13 +362,13 @@ $$
   &\quad+
     \underbrace{2TNDs}_{\text{index K cache write}} \\
   &\quad+
-    \underbrace{TNDs + \sum_b Q_bNL_bDs + 4\sum_b Q_bNB_n}_{\text{block score}} \\
+    \underbrace{TNDs + \sum_b \frac{Q_b}{B_q}NL_bDs + 4\sum_b Q_bNB_n}_{\text{block score}} \\
   &\quad+
     \underbrace{4\sum_b Q_bNB_n + 4TNK}_{\text{top-k selection}}
 \end{aligned}
 $$
 
-其中 index K cache 读按 logical lower/upper 相同的口径写成 $\sum_b Q_bNL_bDs$；如果后续 profiling 证明 kernel 有额外复用，可再下调该项。
+其中 index K cache 读按 vLLM `_index_block_score_kernel` 的实测行为建模：每个 128-token K-block 被加载一次后被 $B_q = 64$ 个 query token 复用（`tl.dot(q, k)`），读量为 $\sum_b \frac{Q_b}{B_q}NL_bDs$。
 
 ### 4.2 Sparse Attention
 

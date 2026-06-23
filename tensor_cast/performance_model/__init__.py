@@ -2524,7 +2524,9 @@ def _(
         block_size,
     )
 
-    properties = op_invoke_info.get_memory_access_properties()
+    # Exclude idx_q (args[0]) and idx_k (args[1]): their reads/writes are already
+    # counted inside breakdown["bytes_total"] (read_idx_q_bytes + cache write).
+    properties = op_invoke_info.get_memory_access_properties(exclude_input_ids={0, 1})
     _accumulate_compute_ops(
         properties,
         idx_q.dtype,
