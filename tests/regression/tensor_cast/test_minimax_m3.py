@@ -84,6 +84,12 @@ def test_minimax_sparse_attention_op_registered():
     assert hasattr(torch.ops.tensor_cast, "minimax_sparse_attention"), "minimax_sparse_attention op not registered"
 
 
+def test_siso_reshape_and_cache_op_registered():
+    assert hasattr(
+        torch.ops.tensor_cast, "siso_reshape_and_cache"
+    ), "siso_reshape_and_cache op not registered"
+
+
 def test_minimax_indexer_meta_shape():
     idx_q = torch.empty(1, 4, 128, device="meta")
     idx_k = torch.empty(1, 1, 128, device="meta")
@@ -112,6 +118,9 @@ def test_minimax_indexer_k_cache_read_uses_block_size_q():
     token), which overestimated vLLM's `_index_block_score_kernel` by ~64x. The
     kernel tiles queries into BLOCK_SIZE_Q=64 and reuses each K-block across the
     tile via tl.dot(q, k).
+
+    Note: index K cache write (2*TDs) is modeled by the standalone
+    siso_reshape_and_cache op and is NOT part of this breakdown.
     """
     # Q_b=64, L_b=128, N=1, D=128, K=16, B_s=128, bf16 (s=2)
     # Naive (old): 64*1*128*128*2 = 2_097_152 bytes for K read alone
@@ -169,6 +178,68 @@ def test_minimax_indexer_no_double_count_input_tensors():
     input_tensor_bytes = bytes_of_tensor(idx_q) + bytes_of_tensor(idx_k)
     assert _total_memory_bytes(auto_included) >= _total_memory_bytes(auto_excluded) + input_tensor_bytes
     assert _total_memory_bytes(props) == _total_memory_bytes(auto_excluded) + breakdown["bytes_total"]
+
+
+def test_minimax_indexer_excludes_cache_write():
+    """minimax_indexer breakdown must NOT depend on idx_k element size (cache write).
+
+    Cache write is now modeled by the standalone siso_reshape_and_cache op,
+    so changing idx_k dtype (which only affects cache write bytes) must leave
+    the indexer breakdown unchanged.
+    """
+    t, num_heads, head_dim, topk_blocks, block_size = 64, 1, 128, 16, 128
+    seq_lens = torch.tensor([128])
+    query_lens = torch.tensor([64])
+
+    idx_q = torch.empty(t, num_heads, head_dim, device="meta", dtype=torch.bfloat16)
+    idx_k_bf16 = torch.empty(t, 1, head_dim, device="meta", dtype=torch.bfloat16)
+    idx_k_fp32 = torch.empty(t, 1, head_dim, device="meta", dtype=torch.float32)
+
+    bd_bf16 = _estimate_minimax_indexer_breakdown(
+        idx_q, idx_k_bf16, seq_lens, query_lens, topk_blocks=topk_blocks, block_size=block_size
+    )
+    bd_fp32 = _estimate_minimax_indexer_breakdown(
+        idx_q, idx_k_fp32, seq_lens, query_lens, topk_blocks=topk_blocks, block_size=block_size
+    )
+    assert bd_bf16["bytes_total"] == bd_fp32["bytes_total"], (
+        "minimax_indexer bytes_total depends on idx_k dtype; cache write not fully removed"
+    )
+
+
+def test_siso_reshape_and_cache_properties():
+    """siso_reshape_and_cache must model 2*TDs traffic (read key + write cache)."""
+    t, head_dim = 64, 128
+    idx_k = torch.empty(t, 1, head_dim, device="meta", dtype=torch.bfloat16)
+    indexer_cache = torch.empty(4, 128, head_dim, device="meta", dtype=torch.bfloat16)
+    slot_mapping = torch.empty(t, device="meta", dtype=torch.long)
+
+    op = OpInvokeInfo(
+        torch.ops.tensor_cast.siso_reshape_and_cache.default,
+        (idx_k, indexer_cache, slot_mapping),
+        {},
+        None,
+    )
+    props = op.get_perf_properties()
+
+    # The cache write models: read key (TDs) + write to cache (TDs).
+    # key read is auto-counted (memory_read_bytes), cache write is attributed
+    # explicitly (memory_write_bytes). slot_mapping read is incidental auto-traffic.
+    idx_k_bytes = bytes_of_tensor(idx_k, dtype=indexer_cache.dtype)
+    assert props.memory_write_bytes == idx_k_bytes, (
+        f"write bytes mismatch: got {props.memory_write_bytes}, expected {idx_k_bytes}"
+    )
+    assert props.memory_read_bytes >= idx_k_bytes, "key read not accounted"
+    assert not props.compute_ops, "cache write must be memory-only"
+
+
+def test_siso_reshape_and_cache_meta():
+    """siso_reshape_and_cache op is registered and returns None."""
+    idx_k = torch.empty(1, 1, 128, device="meta")
+    indexer_cache = torch.empty(4, 128, 128, device="meta")
+    slot_mapping = torch.empty(1, device="meta", dtype=torch.long)
+
+    result = torch.ops.tensor_cast.siso_reshape_and_cache(idx_k, indexer_cache, slot_mapping)
+    assert result is None
 
 
 def test_minimax_sparse_attention_meta_shape():

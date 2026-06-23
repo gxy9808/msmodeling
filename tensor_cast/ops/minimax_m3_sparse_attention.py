@@ -22,8 +22,8 @@ def _(
     Boundary:
       index Q/K block score -> top-k block indices.
 
-    Index q/k projections, norm, and RoPE are explicit ops in
-    MiniMaxM3AttentionWrapper.forward.
+    Index q/k projections, norm, RoPE, and index K cache write are explicit ops
+    in MiniMaxM3AttentionWrapper.forward.
 
     Performance formula: see M3-msmodeling.md section 4.1.
     """

@@ -206,6 +206,12 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
 
         idx_q_flat = idx_q_states.transpose(1, 2).reshape(num_tokens, self.num_indexer_heads, self.indexer_head_dim)
         idx_k_flat = idx_k_states.transpose(1, 2).reshape(num_tokens, 1, self.indexer_head_dim)
+
+        indexer_cache_by_layers = kwargs.get("indexer_cache_by_layers", None)
+        indexer_cache = indexer_cache_by_layers.get(inner.layer_idx) if indexer_cache_by_layers else None
+        if indexer_cache is not None and attention_meta is not None:
+            torch.ops.tensor_cast.siso_reshape_and_cache(idx_k_flat, indexer_cache, attention_meta.slot_mapping)
+
         topk_idx = torch.ops.tensor_cast.minimax_indexer(
             idx_q_flat,
             idx_k_flat,

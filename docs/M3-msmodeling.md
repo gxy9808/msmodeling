@@ -132,12 +132,14 @@ TensorCast 的性能建模采用 **"一算子一建模"** 架构，模型适配�
 
 ---
 
-## 4. Indexer 与 Sparse Attention 的 op 拆分和公式
+## 4. Indexer 与 Sparse Attention 的性能建模公式
 
-MiniMax-M3 sparse layer 可以拆成两个主要建模边界：
+MiniMax-M3 sparse layer 的计算可拆成两个建模边界，本章推导各自的 FLOPs 与访存量公式：
 
-1. `minimax_indexer`：从 index Q/K projection 开始，到 top-k block 输出结束
-2. `minimax_sparse_attention`：主 attention 根据 top-k block 访问标准 K/V cache
+1. **Indexer**：index K cache write → block score → top-k block 输出（projection / norm / RoPE 不在本章范围）
+2. **Sparse Attention**：主 attention 根据 top-k block 访问标准 K/V cache
+
+> 仿真侧如何把上述边界落地为虚拟 op / trace op、以及 projection / norm / RoPE 如何建模，见第 5 章。本章只关心算法本身的性能建模公式。
 
 术语约定：
 
@@ -175,75 +177,11 @@ MiniMax-M3 sparse layer 可以拆成两个主要建模边界：
 > $N_{\mathrm{indexer}}$ 和 $D_{\mathrm{indexer}}$，即 indexer head 数和
 > indexer head dim；它们不表示 4.2 主 attention 中的 query/KV head 数或标准 head dim。
 
-参照`_estimate_dsa_indexer_breakdown` 的拆解口径，Indexer 可以作为一个从 index Q/K projection 开始、到 top-k block 输出结束的 fused 虚拟 op： `minimax_indexer`。该 op 覆盖 index 分支的投影、norm、RoPE、index cache 写入、block score 和 top-k。
+Indexer 的计算由三个阶段组成：index K cache write（§4.1.1）、block score（§4.1.2）和 top-k selection（§4.1.3）。Index 分支的 projection、norm、RoPE 不属于 Indexer 建模边界，其计算量与访存量另行统计。
 
-#### 4.1.1 Index Q/K Projection
+#### 4.1.1 Index Cache Write
 
-MiniMax-M3 的 index 分支在 sparse layer 中额外执行：
-
-```text
-index_q_proj: hidden [T, H] -> idx_q [T, N, D]
-index_k_proj: hidden [T, H] -> idx_k [T, N, D]
-```
-
-计算量：
-
-$$
-\begin{aligned}
-\mathrm{index\_q\_proj\_mma} &= 2THND \\
-\mathrm{index\_k\_proj\_mma} &= 2THND
-\end{aligned}
-$$
-
-访存量：
-
-$$
-\begin{aligned}
-\mathrm{read\_hidden\_bytes} &= 2THs \\
-\mathrm{read\_wq\_bytes} &= HNDs \\
-\mathrm{read\_wk\_bytes} &= HNDs \\
-\mathrm{write\_idx\_qk\_bytes} &= 2TNDs
-\end{aligned}
-$$
-
-#### 4.1.2 Index Q/K Norm 与 RoPE
-
-`qk_norm_type="per_head"` 时，`idx_q` 和`idx_k` 都 reshape 到 $[-1, D]$ 后做 GemmaRMSNorm；随后对前 $D_r$ 维施加 RoPE。
-
-计算量：
-
-$$
-\begin{aligned}
-\mathrm{index\_norm\_gp} &\approx 12TND \\
-\mathrm{index\_rope\_gp} &\approx 6TND_r
-\end{aligned}
-$$
-
-访存量：
-
-$$
-\begin{aligned}
-\mathrm{read\_write\_norm\_bytes} &\approx 4TNDs \\
-\mathrm{read\_write\_rope\_bytes} &\approx 4TNDs \\
-\mathrm{read\_norm\_weight\_bytes} &= 2NDs
-\end{aligned}
-$$
-
-常量来源：
-
-| 常量 | 来源 |
-|------|------|
-| $12$ | `idx_q` 和`idx_k` 两路都做 RMSNorm；每路按每元素约 $6$ 个 GP 操作估算，包括平方、reduce 均摊、rsqrt、scale、weight 和写回相关的 elementwise 开销，因此为 $2 \times 6$。 |
-| $6$ | `idx_q` 和`idx_k` 两路都做 RoPE；每路对前 $D_r$ 维按每元素约 $3$ 个 GP 操作估算，包括 sin/cos 旋转中的乘加和交换/组合开销，因此为 $2 \times 3$。 |
-| 第一个 $4$ | norm 访存包含 Q/K 两路，每路近似一次读输入、一次写输出，即 $2 \times 2TNDs$。 |
-| 第二个 $4$ | RoPE 访存同样包含 Q/K 两路，每路近似一次读、一次写；即使只旋转前 $D_r$ 维，实际 kernel 往往按完整 head tensor 读写，因此保守写成 $4TNDs$。 |
-| $2$ | norm weight 有 Q/K 两套参数，各自大小为 $ND$，因此为 $2NDs$。 |
-
-GemmaRMSNorm 的`1 + weight` 可并入 norm 的 elementwise GP 桶，不需要单独建 MMA。
-
-#### 4.1.3 Index Cache Write
-
-写入当前 token 的 index K cache。
+写入当前 token 的 index K cache。index K cache 为单 head，对应张量 shape `[T, 1, D]`。
 
 计算量：
 
@@ -255,14 +193,14 @@ $$
 
 $$
 \begin{aligned}
-\mathrm{read\_idx\_k\_bytes\_current} &= TNDs \\
-\mathrm{write\_idx\_k\_cache\_bytes} &= TNDs
+\mathrm{read\_idx\_k\_bytes\_current} &= TDs \\
+\mathrm{write\_idx\_k\_cache\_bytes} &= TDs
 \end{aligned}
 $$
 
-#### 4.1.4 Index Block Score
+#### 4.1.2 Index Block Score
 
-对应 vLLM 中 `_index_block_score_kernel`（`vllm/models/minimax_m3/common/ops/index_topk.py`）的 score 部分：`idx_q` 与 index K cache 打分，然后按 `sparse_block_size` 聚合到 block score。index Q/K 都有 $N$ 个 head，打分时按 indexer head 对齐。
+对应 vLLM 中 `_index_block_score_kernel`（`vllm/models/minimax_m3/common/ops/index_topk.py`）的 score 部分：`idx_q [T, N, D]` 与 index K cache 打分，然后按 `sparse_block_size` 聚合到 block score。index Q 有 $N$ 个 head；index K cache 为单 head（$[T, 1, D]$），各 indexer head 对同一份 K cache 独立打分。
 
 计算量按 request 求和：
 
@@ -293,13 +231,9 @@ $$
 
 其中 $B_q = 64$ 是kernel中Q的tile大小：key cache被加载一次后被 $B_q$ 个 query token 共享，因此 K cache 读量按 query tile 数 $\lceil Q_b / B_q \rceil$ 而非 query token 数计；近似写成 $Q_b / B_q$。
 
-#### 4.1.5 Top-k Selection
+#### 4.1.3 Top-k Selection
 
-从 block score 中选择 top-k block，并输出给 4.2 的 sparse attention：
-
-```text
-topk_idx: [N, T, K]  # 或按 kernel 排布为等价形状
-```
+从 block score 中选择每个 indexer head 的 top-k block，输出 top-k block 索引供 4.2 的 sparse attention 使用（$T$ 个 token、$N$ 个 head、每个 head 选 $K$ 个 block）。
 
 计算量：
 
@@ -319,33 +253,28 @@ $$
 \end{aligned}
 $$
 
-#### 4.1.6 Indexer 汇总
+#### 4.1.4 Indexer 汇总
 
-`minimax_indexer` 按完整 fused 子图建模，从 index Q/K projection 一直计到 top-k block 输出。汇总时包含 projection、norm、RoPE、index K cache write、 block score 和 top-k selection。
+将 §4.1.1–4.1.3 三个阶段的计算量与访存量汇总（projection / norm / RoPE 不在此汇总内）。
 
 $$
 \begin{aligned}
 \mathrm{MMA}_{\mathrm{indexer}}
-  &= \mathrm{index\_q\_proj\_mma}
-   + \mathrm{index\_k\_proj\_mma}
-   + \mathrm{index\_qk\_mma} \\
+  &= \mathrm{index\_qk\_mma} \\
 \mathrm{GP}_{\mathrm{indexer}}
-  &= \mathrm{index\_norm\_gp}
-   + \mathrm{index\_rope\_gp}
-   + \mathrm{block\_reduce\_gp}
+  &= \mathrm{block\_reduce\_gp}
    + \mathrm{topk\_gp}
 \end{aligned}
 $$
 
-代入 4.1.1 到 4.1.5 的公式后：
+代入 4.1.1 到 4.1.3 的公式后：
 
 $$
 \begin{aligned}
 \mathrm{MMA}_{\mathrm{indexer}}
-  &= 4THND + 2\sum_b Q_bNL_bD \\
+  &= 2\sum_b Q_bNL_bD \\
 \mathrm{GP}_{\mathrm{indexer}}
-  &\approx 12TND + 6TND_r
-   + \sum_b Q_bNL_b
+  &\approx \sum_b Q_bNL_b
    + c_{\mathrm{topk}}\sum_b Q_bNB_n
 \end{aligned}
 $$
@@ -356,11 +285,7 @@ $$
 \begin{aligned}
 \mathrm{Bytes}_{\mathrm{indexer}}
   &\approx
-    \underbrace{2THs + 2HNDs + 2TNDs}_{\text{index Q/K projection}} \\
-  &\quad+
-    \underbrace{4TNDs + 4TNDs + 2NDs}_{\text{index Q/K norm + RoPE}} \\
-  &\quad+
-    \underbrace{2TNDs}_{\text{index K cache write}} \\
+    \underbrace{2TDs}_{\text{index K cache write}} \\
   &\quad+
     \underbrace{TNDs + \sum_b \frac{Q_b}{B_q}NL_bDs + 4\sum_b Q_bNB_n}_{\text{block score}} \\
   &\quad+
@@ -372,7 +297,7 @@ $$
 
 ### 4.2 Sparse Attention
 
-Sparse attention 使用 Indexer 输出的`topk_idx`，从标准 K/V cache 中取 selected blocks 做主 attention。本节只需要建模`minimax_sparse_attention`。
+Sparse attention 使用 Indexer 输出的 top-k block 索引，从标准 K/V cache 中取 selected blocks 做主 attention。
 
 计算量：
 
@@ -420,7 +345,7 @@ $$
 
 本章按第 3 章的四层架构顺序展开：**模型定义层 -> 抽象算子层 -> 虚拟算子层 -> 性能模型层**。适配目标是把 MiniMax-M3 sparse layer 显式拆成两个可建模边界：
 
-1. `minimax_indexer`：从 index Q/K projection 到 top-k block 输出，公式见 4.1。
+1. `minimax_indexer`：index K cache write → top-k block 输出，公式见 4.1（projection / norm / RoPE 为 trace 显式 op）。
 2. `minimax_sparse_attention`：根据 top-k block 访问标准 K/V cache 做 sparse attention，公式见 4.2。
 
 ### 5.1 模型定义层：注册 MiniMax-M3 ModelProfile
@@ -484,15 +409,13 @@ tensor_cast/layers/minimax_m3_attention.py
 
 ```python
 if is_sparse_layer:
+    # indexer q/k proj, norm, RoPE are explicit ops before this call
     topk_idx = torch.ops.tensor_cast.minimax_indexer(
-        hidden_states,
+        idx_q_flat,
+        idx_k_flat,
         seq_lens,
         query_lens,
         block_table,
-        hidden_size=hidden_size,
-        num_indexer_heads=num_indexer_heads,
-        indexer_head_dim=indexer_head_dim,
-        indexer_rope_dim=indexer_rope_dim,
         topk_blocks=topk_blocks,
         block_size=block_size,
     )
@@ -533,15 +456,12 @@ tensor_cast/ops/minimax_m3_sparse_attention.py
 ```python
 @register_tensor_cast_op("minimax_indexer")
 def _(
-    hidden_states: torch.Tensor,
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
     seq_lens: torch.Tensor,
     query_lens: torch.Tensor,
     block_table: torch.Tensor,
     *,
-    hidden_size: int,
-    num_indexer_heads: int,
-    indexer_head_dim: int,
-    indexer_rope_dim: int,
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
@@ -549,12 +469,15 @@ def _(
     MiniMax-M3 indexer fused op.
 
     Boundary:
-      hidden -> index_q_proj/index_k_proj -> norm -> RoPE -> index K cache write
-      -> index QK block score -> top-k block indices.
+      index K cache write -> index QK block score -> top-k block indices.
+
+    Index q/k projections, norm, and RoPE are explicit ops in
+    MiniMaxM3AttentionWrapper.forward.
 
     Performance formula: see section 4.1.
     """
-    total_tokens = hidden_states.shape[0]
+    total_tokens = idx_q.shape[0]
+    num_indexer_heads = idx_q.shape[1]
     return torch.empty(
         (total_tokens, num_indexer_heads, topk_blocks),
         dtype=torch.int32,
@@ -625,16 +548,14 @@ def _estimate_minimax_sparse_attention_breakdown(...):
 
 #### 5.4.1 `minimax_indexer` 拆解
 
-`minimax_indexer` 使用 4.1.6 的完整 fused 口径，不再判断 projection / norm / RoPE 是否已被基础 TensorCast op 捕获。
+`minimax_indexer` 使用 4.1.4 的汇总口径，仅建模 index K cache write、block score 和 top-k。Projection / norm / RoPE 由 trace 中的显式 op 单独统计。
 
 输入量定义：
 
 ```python
-T = sum(query_lens)
-H = hidden_size
-N = num_indexer_heads
-D = indexer_head_dim
-D_r = indexer_rope_dim
+T = idx_q.shape[0]
+N = idx_q.shape[1]
+D = idx_q.shape[2]
 K = topk_blocks
 B_s = block_size
 B_n = ceil(seq_lens / B_s)
@@ -643,24 +564,19 @@ B_n = ceil(seq_lens / B_s)
 计算桶：
 
 ```text
-MMA = 4 * T * H * N * D
-    + 2 * sum_b(Q_b * N * L_b * D)
+MMA = 2 * sum_b(Q_b * N * L_b * D)
 
-GP  = 12 * T * N * D
-    + 6 * T * N * D_r
-    + sum_b(Q_b * N * L_b)
+GP  = sum_b(Q_b * N * L_b)
     + c_topk * sum_b(Q_b * N * B_n)
 ```
 
-访存桶按 4.1.6 的`Bytes_indexer` 汇总。实现时可以先把各阶段拆成命名变量，再求和，方便 profiling 校正：
+访存桶按 4.1.4 的`Bytes_indexer` 汇总。实现时可以先把各阶段拆成命名变量，再求和，方便 profiling 校正：
 
 ```python
-bytes_projection = 2*T*H*s + 2*H*N*D*s + 2*T*N*D*s
-bytes_norm_rope = 4*T*N*D*s + 4*T*N*D*s + 2*N*D*s
-bytes_cache_write = 2*T*N*D*s
-bytes_score = T*N*D*s + sum_b(Q_b*N*L_b*D*s) + 4*sum_b(Q_b*N*B_n)
-bytes_topk = 4*sum_b(Q_b*N*B_n) + 4*T*N*K
-bytes_total = bytes_projection + bytes_norm_rope + bytes_cache_write + bytes_score + bytes_topk
+bytes_cache_write = 2 * T * D * s
+bytes_score = T * N * D * s + sum_b((Q_b / B_q) * N * L_b * D * s) + 4 * sum_b(Q_b * N * B_n)
+bytes_topk = 4 * sum_b(Q_b * N * B_n) + 4 * T * N * K
+bytes_total = bytes_cache_write + bytes_score + bytes_topk
 ```
 
 #### 5.4.2 `minimax_sparse_attention` 拆解
@@ -764,8 +680,10 @@ model.forward(**inputs)
     │     调用已有 tensor_cast.attention / linear / norm / rotary / MoE 算子
     │
     └── sparse layer:
-          1. 调用 torch.ops.tensor_cast.minimax_indexer(...)
-          2. 调用 torch.ops.tensor_cast.minimax_sparse_attention(...)
+          1. indexer q/k proj, norm, fused_rope（显式 op）
+          2. 调用 torch.ops.tensor_cast.minimax_indexer(...)
+          3. 调用 torch.ops.tensor_cast.reshape_and_cache（主 KV）
+          4. 调用 torch.ops.tensor_cast.minimax_sparse_attention(...)
     │
     ▼
 Runtime.__torch_dispatch__(...)
@@ -789,9 +707,7 @@ Runtime.__exit__()
         │   │   │
         │   │   └── _estimate_minimax_indexer_breakdown()
         │   │       │
-        │   │       └── 拆解为 4.1.6:
-        │   │           ├── index_q_proj_mma + index_k_proj_mma
-        │   │           ├── index_norm_gp + index_rope_gp
+        │   │       └── 拆解为 4.1.4:
         │   │           ├── index_qk_mma + block_reduce_gp
         │   │           ├── topk_gp
         │   │           └── Bytes_indexer
@@ -845,14 +761,11 @@ def test_minimax_m3_sparse_attention_ops():
         block_table = torch.empty(1, 32, device="meta", dtype=torch.long)
 
         topk_idx = torch.ops.tensor_cast.minimax_indexer(
-            torch.empty(1, 6144, device="meta"),
+            torch.empty(1, 4, 128, device="meta"),
+            torch.empty(1, 1, 128, device="meta"),
             seq_lens,
             query_lens,
             block_table,
-            hidden_size=6144,
-            num_indexer_heads=4,
-            indexer_head_dim=128,
-            indexer_rope_dim=64,
             topk_blocks=16,
             block_size=128,
         )

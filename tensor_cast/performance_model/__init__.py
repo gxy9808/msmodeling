@@ -260,6 +260,21 @@ def _(
     return properties
 
 
+@OpInvokeInfo.register_op_properties(torch.ops.tensor_cast.siso_reshape_and_cache.default)
+def _(
+    op_invoke_info: OpInvokeInfo,
+) -> OpInvokeInfo.PerformanceProperties:
+    assert len(op_invoke_info.args) == 3
+    key = op_invoke_info.args[0]
+    kv_cache = op_invoke_info.args[1]
+
+    # key read is auto-counted by get_memory_access_properties; the cache write
+    # is attributed to kv_cache via memory_write_bytes.
+    properties = op_invoke_info.get_memory_access_properties(exclude_input_ids={1})
+    properties.memory_write_bytes += bytes_of_tensor(key, dtype=kv_cache.dtype)
+    return properties
+
+
 def _attention_properties_helper(
     op_invoke_info: OpInvokeInfo,
     query,
@@ -2416,8 +2431,8 @@ def _estimate_minimax_indexer_breakdown(
     c_topk = max(int(math.ceil(math.log2(max(K, 2)))), 1)
     topk_gp = c_topk * sum_qb_nb_bn
 
-    # 4.1.3 Index K Cache Write
-    bytes_cache_write = bytes_of_tensor(idx_k)
+    # Index K cache write is modeled by the standalone siso_reshape_and_cache op
+    # and therefore excluded from minimax_indexer's bytes_total.
 
     # 4.1.4 Block Score
     bytes_score = bytes_of_tensor(idx_q)
@@ -2434,7 +2449,7 @@ def _estimate_minimax_indexer_breakdown(
 
     mma_total = index_qk_mma
     gp_total = block_reduce_gp + topk_gp
-    bytes_total = bytes_cache_write + bytes_score + bytes_topk
+    bytes_total = bytes_score + bytes_topk
 
     return {
         "mma_total": mma_total,
@@ -2524,8 +2539,10 @@ def _(
         block_size,
     )
 
-    # Exclude idx_q (args[0]) and idx_k (args[1]): their reads/writes are already
-    # counted inside breakdown["bytes_total"] (read_idx_q_bytes + cache write).
+    # Exclude idx_q (args[0]) and idx_k (args[1]): idx_q read is counted inside
+    # breakdown["bytes_total"] (block score formula), and idx_k is read by the
+    # block score K-cache term. Index K cache write is modeled by the standalone
+    # siso_reshape_and_cache op, not here.
     properties = op_invoke_info.get_memory_access_properties(exclude_input_ids={0, 1})
     _accumulate_compute_ops(
         properties,
