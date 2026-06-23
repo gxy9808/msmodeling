@@ -1,4 +1,3 @@
-import pytest
 import torch
 from torch._inductor.compile_fx import fake_tensor_prop
 
@@ -76,15 +75,11 @@ def _wrap_expert_fp8(expert: MiniMaxM3MoeExpertMLP) -> MiniMaxM3MoeExpertMLP:
 
 
 def test_minimax_indexer_op_registered():
-    assert hasattr(torch.ops.tensor_cast, "minimax_indexer"), (
-        "minimax_indexer op not registered"
-    )
+    assert hasattr(torch.ops.tensor_cast, "minimax_indexer"), "minimax_indexer op not registered"
 
 
 def test_minimax_sparse_attention_op_registered():
-    assert hasattr(torch.ops.tensor_cast, "minimax_sparse_attention"), (
-        "minimax_sparse_attention op not registered"
-    )
+    assert hasattr(torch.ops.tensor_cast, "minimax_sparse_attention"), "minimax_sparse_attention op not registered"
 
 
 def test_minimax_indexer_meta_shape():
@@ -106,6 +101,37 @@ def test_minimax_indexer_meta_shape():
 
     assert topk_idx.shape == (1, 4, 16)
     assert topk_idx.dtype == torch.int32
+
+
+def test_minimax_indexer_k_cache_read_uses_block_size_q():
+    """K-cache read term must be divided by BLOCK_SIZE_Q=64, not per-query-token.
+
+    Regression: old formula counted `Q_b * N * L_b * D * s` (read K once per query
+    token), which overestimated vLLM's `_index_block_score_kernel` by ~64x. The
+    kernel tiles queries into BLOCK_SIZE_Q=64 and reuses each K-block across the
+    tile via tl.dot(q, k).
+    """
+    from tensor_cast.performance_model import _estimate_minimax_indexer_breakdown
+
+    # Q_b=64, L_b=128, N=1, D=128, K=16, B_s=128, bf16 (s=2)
+    # Naive (old): 64*1*128*128*2 = 2_097_152 bytes for K read alone
+    # vLLM kernel: K read once per B_q=64 query tile -> 2_097_152 / 64 = 32_768 bytes
+    idx_q = torch.empty(64, 1, 128, device="meta", dtype=torch.bfloat16)
+    idx_k = torch.empty(64, 1, 128, device="meta", dtype=torch.bfloat16)
+    seq_lens = torch.tensor([128])
+    query_lens = torch.tensor([64])
+
+    bd = _estimate_minimax_indexer_breakdown(
+        idx_q,
+        idx_k,
+        seq_lens,
+        query_lens,
+        topk_blocks=16,
+        block_size=128,
+    )
+    # If the formula is wrong (no /64), bytes_total would be > 2 MB.
+    # Correct formula gives ~32 KB for K read plus a few KB for score writes.
+    assert bd["bytes_total"] < 100_000, f"K-cache read not divided by BLOCK_SIZE_Q=64; bytes_total={bd['bytes_total']}"
 
 
 def test_minimax_sparse_attention_meta_shape():
@@ -141,9 +167,7 @@ def test_minimax_indexer_properties():
     assert hasattr(
         OpInvokeInfo._op_properties_functors,
         "__getitem__",
-    ) or hasattr(OpInvokeInfo, "get_perf_properties"), (
-        "OpInvokeInfo missing properties registry"
-    )
+    ) or hasattr(OpInvokeInfo, "get_perf_properties"), "OpInvokeInfo missing properties registry"
 
 
 def test_minimax_m3_fused_moe_does_not_ep_all_reduce_like_deepseek():
@@ -204,9 +228,7 @@ def test_minimax_m3_moe_expert_uses_fp8_linear_for_gate_up_and_down():
     result = runtime.table_averages()
     assert output.shape == hidden_states.shape
     fp8_line = next(line for line in result.splitlines() if "tensor_cast.fp8_linear.default" in line)
-    quant_line = next(
-        line for line in result.splitlines() if "tensor_cast.dynamic_quantize_symmetric.default" in line
-    )
+    quant_line = next(line for line in result.splitlines() if "tensor_cast.dynamic_quantize_symmetric.default" in line)
     assert fp8_line.split()[-1] == "3"
     assert quant_line.split()[-1] == "2"
     assert "tensor_cast.m3_swiglu_quant.default" in result

@@ -2368,6 +2368,11 @@ def _safe_tensor_int_list(values, fallback_total: int | None = None) -> list[int
     return [int(v) for v in values]
 
 
+# vLLM Triton `_index_block_score_kernel` tiles queries into BLOCK_SIZE_Q=64 rows
+# and loads each 128-token K-block once per query tile (see index_topk.py:81-163).
+_INDEXER_BLOCK_SIZE_Q = 64
+
+
 def _estimate_minimax_indexer_breakdown(
     idx_q: torch.Tensor,
     idx_k: torch.Tensor,
@@ -2418,7 +2423,10 @@ def _estimate_minimax_indexer_breakdown(
     bytes_score = bytes_of_tensor(idx_q)
     for Q_b, L_b in zip(Q_b_list, L_b_list):
         B_n = math.ceil(L_b / B_s) if B_s > 0 else 0
-        bytes_score += Q_b * N * L_b * D * s
+        # K-cache is read once per BLOCK_SIZE_Q query tile (tl.dot(q, k) reuses a K-block
+        # across BLOCK_SIZE_Q queries), not once per query token. Matches vLLM
+        # `_index_block_score_kernel`.
+        bytes_score += (Q_b / _INDEXER_BLOCK_SIZE_Q) * N * L_b * D * s
         bytes_score += 4 * Q_b * N * B_n
 
     # 4.1.5 Top-k Selection
