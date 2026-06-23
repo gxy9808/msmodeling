@@ -36,11 +36,21 @@ _M3_MXFP8_GROUP_SIZE = 128
 
 
 class MiniMaxM3MoeExpertMLP(torch.nn.Module):
-    """Per-expert MLP aligned with ``MoeExpertMLP`` (DeepSeek path).
+    """Per-expert MLP for routed experts in MoE layers (layer 3-59).
 
-    We never run fused ``gate_up_proj`` + ``chunk`` in forward: compile passes expect
-    separate ``gate_proj`` / ``up_proj`` sharing the same hidden states. Fused checkpoint
-    weights are split once at init (dim=0), same as ``custom_model_registry.MoeExpertMLP``.
+    Adapts M3's fused ``gate_up_proj`` weight layout to the split
+    ``gate_proj`` / ``up_proj`` structure that ``SinkSplitPass`` and
+    ``GroupedMatmulSwigluPass`` require.  The fused weight is split once
+    at construction (``chunk(2, dim=0)``); forward never emits a fused
+    matmul + ``chunk`` so the FX graph matches the DeepSeek expert pattern.
+
+    Registered via ``ModelProfile.custom_expert_module_type`` and instantiated
+    per expert by ``transformations._patch_moe_expert_helper``.
+
+    When ``down_proj`` is quantized (``TensorCastQuantLinear``), the fused
+    ``m3_swiglu_quant`` op (SwiGLU + post-activation quant) is used so the
+    activation scale is produced in-line and fed directly to ``down_proj``,
+    avoiding a redundant ``dynamic_quantize_symmetric`` call.
     """
 
     def __init__(
@@ -84,20 +94,24 @@ class MiniMaxM3MoeExpertMLP(torch.nn.Module):
         return self.down_proj(hidden_states)
 
 
-class _MoeReturnCompat(torch.nn.Module):
-    def __init__(self, moe):
-        super().__init__()
-        self._moe = moe
-
-    def forward(self, hidden_states):
-        result = self._moe(hidden_states)
-        if isinstance(result, tuple):
-            return result
-        return result, None
-
-
 class MiniMaxM3DenseMLPWrapper(torch.nn.Module):
-    """Dense FFN wrapper: gate/up linears like ``MoeExpertMLP``, then ``m3_swiglu_quant``."""
+    """Dense FFN wrapper for non-MoE layers (layer 0-2 and MTP blocks).
+
+    M3's upstream ``MiniMaxM3VLDenseMLP`` stores a fused ``gate_up_proj``
+    (``nn.Linear`` with ``out_features = 2 * intermediate``) and runs a
+    single matmul followed by ``chunk(2, dim=-1)`` in forward.  This wrapper
+    splits the weight into separate ``gate_proj`` / ``up_proj`` linears so the
+    FX graph is structurally identical to ``MiniMaxM3MoeExpertMLP`` and the
+    same compile passes (``SinkSplitPass``, ``GroupedMatmulSwigluPass``) apply.
+
+    Installed by ``patch_minimax_m3_dense_mlp`` which replaces every
+    ``MiniMaxM3VLDenseMLP`` module with this wrapper.  ``down_proj`` is reused
+    from the original module (not rebuilt) to preserve any quantization state.
+
+    Quantization behavior matches ``MiniMaxM3MoeExpertMLP``: when ``down_proj``
+    is a ``TensorCastQuantLinear``, forward uses ``m3_swiglu_quant`` to produce
+    the int8 activation and scale in one fused op.
+    """
 
     def __init__(self, mlp, group_size: int = 128):
         super().__init__()
@@ -249,22 +263,6 @@ def _patch_minimax_m3_hf_config(hf_config, model_id):
                     pass
 
 
-def _patch_m3_moe_return_compat(model):
-    unwrapped = model.unwrap()
-    if not hasattr(unwrapped, "layers"):
-        if hasattr(unwrapped, "model") and hasattr(unwrapped.model, "layers"):
-            unwrapped = unwrapped.model
-        else:
-            return model
-    for layer in unwrapped.layers:
-        while hasattr(layer, "_inner"):
-            layer = layer._inner
-        block_sparse_moe = getattr(layer, "block_sparse_moe", None)
-        if block_sparse_moe is not None and not isinstance(block_sparse_moe, _MoeReturnCompat):
-            layer.block_sparse_moe = _MoeReturnCompat(block_sparse_moe)
-    return model
-
-
 def patch_minimax_m3_dense_mlp(model: TransformerModel) -> TransformerModel:
     for name, module in list(model._inner.named_modules()):
         if isinstance(module, MiniMaxM3DenseMLPWrapper):
@@ -370,7 +368,6 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
     sparse_attention_freq = sparse_cfg.get("sparse_attention_freq", [])
     num_indexer_heads = sparse_cfg.get("sparse_num_index_heads", 4)
     indexer_head_dim = sparse_cfg.get("sparse_index_dim", 128)
-    indexer_rope_dim = getattr(text_config, "rotary_dim", 64)
     topk_blocks = sparse_cfg.get("sparse_topk_blocks", 16)
     block_size = sparse_cfg.get("sparse_block_size", 128)
     local_blocks = sparse_cfg.get("sparse_local_block", 1)
@@ -430,7 +427,6 @@ def patch_minimax_m3_attention(model: TransformerModel) -> TransformerModel:
             head_dim=head_dim,
             num_indexer_heads=per_rank_indexer_heads,
             indexer_head_dim=indexer_head_dim,
-            indexer_rope_dim=indexer_rope_dim,
             topk_blocks=topk_blocks,
             block_size=block_size,
             local_blocks=local_blocks,
@@ -533,19 +529,26 @@ def patch_minimax_m3_layernorm(model: TransformerModel) -> TransformerModel:
 
 
 def patch_apply_rotary_pos_emb_for_fused_rope(model: TransformerModel) -> TransformerModel:
-    """Monkey-patch the HF model's apply_rotary_pos_emb to use fused_rope op.
+    """Monkey-patch the HF module-level ``apply_rotary_pos_emb`` to emit ``fused_rope``.
 
-    On NPU, sgl_kernel_npu.fused_rope_qk_mqa (InterleaveRope in profiling)
-    fuses cos/sin lookup + partial RoPE into a single kernel. This patch
-    replaces the decomposed apply_rotary_pos_emb (mul + rotate_half + add)
-    with the fused_rope op to match the NPU profiling operator count.
+    M3 uses partial RoPE (``rotary_dim`` < ``head_dim``): the upstream function
+    slices ``q[..., :rotary_dim]`` / ``q[..., rotary_dim:]``, rotates the first
+    slice, then concatenates the unrotated tail back — producing a
+    ``slice → rotate_half → mul/add → cat`` subgraph.
 
-    The sglang NPU implementation calls:
-        fused_rope_qk_mqa(query_3d, key_3d, cos_sin, rotary_dim, is_neox_style)
-    where:
-        - query_3d: (num_tokens, num_heads, head_dim)
-        - key_3d: (num_tokens, num_kv_heads, head_dim)
-        - cos_sin: (num_tokens, rotary_dim * 2)
+    The standard RoPE fusion pipeline (``NormalRopePattern`` → ``apply_rope`` →
+    ``FusedRopePass`` → ``fused_rope``) cannot match this pattern because
+    ``NormalRopePattern`` only matches ``(q * cos) + (rotate_half(q) * sin)``
+    applied to the *entire* tensor, with no slice/cat.  Extending the pattern to
+    handle partial RoPE would require new pattern code; until then this
+    monkey-patch is the only way to make dense layers (layer 0-2, whose forward
+    delegates to ``self._inner`` and thus calls the HF function) emit
+    ``fused_rope`` instead of decomposed aten ops.
+
+    Sparse layers are unaffected: ``MiniMaxM3AttentionWrapper`` calls
+    ``fused_rope`` directly and never reaches the HF function.
+
+
     """
     import importlib
 
@@ -610,7 +613,6 @@ def _(model: TransformerModel):
         model,
         lambda moe_config, module: MiniMaxM3MoELayer(moe_config, module),
     )
-    model = _patch_m3_moe_return_compat(model)
     model = quantize_model(model)
     model = shard_model(model)
     return model

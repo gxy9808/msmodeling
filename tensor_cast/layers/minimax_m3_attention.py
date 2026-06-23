@@ -101,7 +101,6 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
         head_dim: int,
         num_indexer_heads: int,
         indexer_head_dim: int,
-        indexer_rope_dim: int,
         topk_blocks: int,
         block_size: int,
         local_blocks: int,
@@ -116,7 +115,6 @@ class MiniMaxM3AttentionWrapper(torch.nn.Module):
         self.head_dim = head_dim
         self.num_indexer_heads = num_indexer_heads
         self.indexer_head_dim = indexer_head_dim
-        self.indexer_rope_dim = indexer_rope_dim
         self.topk_blocks = topk_blocks
         self.block_size = block_size
         self.local_blocks = local_blocks
