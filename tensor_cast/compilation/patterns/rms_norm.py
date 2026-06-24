@@ -37,6 +37,40 @@ class RMSNormPattern:
         return _create_pattern_result(pattern, replacement, get_inputs())
 
 
+class GemmaRMSNormPattern:
+    """Standalone (non-residual) Gemma-style RMSNorm with effective weight ``1 + weight``.
+
+    Matches the decomposition emitted by HF ``MiniMaxM3VLRMSNorm`` (the final
+    ``model.norm`` that is not wrapped by a fused module)::
+
+        output = (x.float() * rsqrt(x.float().pow(2).mean(-1) + eps)) * (1.0 + weight.float())
+        output = output.type_as(x)
+
+    The replacement folds it into ``rms_norm(x, 1.0 + weight, eps)``.
+    """
+
+    @staticmethod
+    def create(dtype):
+        def get_inputs():
+            hidden_states = torch.empty(2, 4, dtype=dtype, device="meta")
+            weight = torch.empty(4, dtype=dtype, device="meta")
+            return [hidden_states, weight]
+
+        def pattern(hidden_states, weight, eps):
+            x_fp32 = hidden_states.float()
+            variance = x_fp32.pow(2).mean(-1, keepdim=True)
+            normed = x_fp32 * torch.rsqrt(variance + eps)
+            out = (normed * (1.0 + weight.float())).type_as(hidden_states)
+            return out
+
+        def replacement(hidden_states, weight, eps):
+            effective_weight = 1.0 + weight
+            out = torch.ops.tensor_cast.rms_norm(hidden_states, effective_weight, eps)
+            return out
+
+        return _create_pattern_result(pattern, replacement, get_inputs())
+
+
 class AddRMSNormPattern:
     @staticmethod
     def create():
@@ -754,6 +788,17 @@ def register_all_patterns():
             pattern, replacement, example_inputs, scalar_workaround = RMSNormPattern.create(dtype)
             register_pattern(
                 f"rms_norm_pattern_{dtype}",
+                pattern,
+                replacement,
+                example_inputs,
+                scalar_workaround=scalar_workaround,
+                level=0,
+            )
+
+        for dtype in _RMS_NORM_DTYPE_LIST:
+            pattern, replacement, example_inputs, scalar_workaround = GemmaRMSNormPattern.create(dtype)
+            register_pattern(
+                f"gemma_rms_norm_pattern_{dtype}",
                 pattern,
                 replacement,
                 example_inputs,

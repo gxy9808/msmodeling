@@ -1,22 +1,20 @@
-# MiniMax-M3 模型在 msmodeling 中的适配指南
+# MiniMax-M3 仿真适配设计文档
 
-> 日期：2026-06-06（2026-06-07 更新：添加代码实现部分与测试验证结果）
+> *Simplicity is prerequisite for reliability.  —  Edsger W. Dijkstra*
 
 ---
 
 ## 1. 背景
 
-MiniMax-M3 是 MiniMax 的第三代大语言模型，核心特点是 **Sparse Attention（稀疏注意力）机制** —— 在部分 attention layer 中使用 index-head 进行 top-k 稀疏注意力，与标准 dense attention 混合。
-
-本指南分析如何在 msmodeling（TensorCast）中为 MiniMax-M3 注册模型适配，使其能够进行性能建模仿真。
+[MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) 是 MiniMax 的第三代多模态大语言模型，核心特点是 [Minimax Sparse Attention](https://arxiv.org/abs/2606.13392) 机制—— 在部分 GQA attention layer 中使用indexer选择top-k个 kv block 计算稀疏注意力，与标准 dense attention 混合。
 
 ---
 
 ## 2. MiniMax-M3 模型架构关键特征
 
-> 注意：Minimax-M3是VL类模型，顶层
-> `model_type="minimax_m3_vl"`；语言模型参数位于`text_config` 中。
-> 本节描述的是`text_config` 对应的 MiniMax-M3 文本 backbone。
+> [!NOTE]
+>
+> Minimax-M3是VL类模型，本节仅描述其文本 backbone。
 
 ### 2.1 总体结构
 
@@ -24,83 +22,59 @@ MiniMax-M3 是 MiniMax 的第三代大语言模型，核心特点是 **Sparse At
 MiniMaxM3SparseForCausalLM
   └── model (MiniMaxM3Model)
       ├── embed_tokens (VocabParallelEmbedding)
-      ├── layers (MiniMaxM3DecoderLayer × num_hidden_layers)
-      │   ├── input_layernorm (RMSNorm / GemmaRMSNorm)
-      │   ├── self_attn (MiniMaxM3Attention)
-      │   │   ├── qkv_proj (QKVParallelLinear)          # 标准 QKV 投影
-      │   │   ├── o_proj (RowParallelLinear)             # 输出投影
-      │   │   ├── q_norm / k_norm (RMSNorm per_head)    # 按 head_dim 归一化，共享权重
+      ├── dense_layer x 3 # 标准GQA + MLP
+      │   ├── input_layernorm (GemmaRMSNorm)
+      │   ├── self_attn
+      │   │   ├── qkv_proj (QKVParallelLinear)           # 标准 QKV 投影
+      │   │   ├── qk_norm (GemmaRMSNorm per_head)        # 按 head_dim 归一化，共享权重
       │   │   ├── rotary_emb (partial RoPE)              # 部分维度 RoPE, rotary_dim=64
-      │   │   ├── [sparse] index_q_proj / index_k_proj   # index 分支 Q/K 投影
-      │   │   │   └── index_v_proj / index_o_proj        # 可选；M3-preview sparse layer 均关闭
-      │   │   │   └── index_q/k_norm                     # index 分支 QK 归一化
-      │   │   └── attn (RadixAttention)
-      │   ├── mlp (MiniMaxM3MLP | MiniMaxM3MoE)
+      │   │   └── attn
+      │   │   ├── o_proj (RowParallelLinear)             # 输出投影
+      │   ├── mlp
       │   │   ├── gate_up_proj (MergedColumnParallelLinear)
       │   │   ├── down_proj (RowParallelLinear)
       │   │   └── [MoE] experts (FusedMoE) + gate (ReplicatedLinear)
       │   │       └── [MoE] shared_experts (MiniMaxM3MLP)
       │   └── post_attention_layernorm (RMSNorm / GemmaRMSNorm)
-      └── norm (RMSNorm / GemmaRMSNorm)
+      ├── sparse_layer x 57  # Sparse Attention + MoE（有共享专家）
+      │   ├── input_layernorm (GemmaRMSNorm)
+      │   ├── self_attn (MiniMaxM3Attention)
+      │   │   ├── qkv_proj (QKVParallelLinear)          # 标准 QKV 投影
+      │   │   ├── q_norm / k_norm (RMSNorm per_head)    # 按 head_dim 归一化，共享权重
+      │   │   ├── rotary_emb (partial RoPE)              # 部分维度 RoPE, rotary_dim=64
+      │   │   ├── [sparse] index_q_proj / index_k_proj   # index 分支 Q/K 投影
+      │   │   │   └── index_v_proj / index_o_proj        # 可选；M3-preview sparse layer 均关闭
+      │   │   │   └── index_q/k_norm                     # index 分支 QK 归一化
+      │   │   └── attn
+      │   │   ├── o_proj (RowParallelLinear)             # 输出投影
+      │   ├── post_attention_layernorm (GemmaRMSNorm)
+      │   ├── moe
+      │   │   ├── gate_up_proj (MergedColumnParallelLinear)
+      │   │   ├── swiglu_oai
+      │   │   ├── down_proj (RowParallelLinear)
+      │   │   └── shared_experts
+      └── final_norm (GemmaRMSNorm)
   └── lm_head (ParallelLMHead)
 ```
 
 ### 2.2 Sparse Attention 机制
 
-MiniMax-M3 的 Sparse Attention 由`text_config.sparse_attention_config` 控制。 `Minimax-M3-preview` 中共有 60 层，`sparse_attention_freq` 前 3 层为 0（dense attention），layer 3-59 为 1（sparse attention）。对应配置如下：
+![image-20260623203126364](https://liujiaxu-pic.oss-cn-beijing.aliyuncs.com/image-20260623203126364.png)
 
-```python
-sparse_attention_config = {
-    "use_sparse_attention": True,
-    "sparse_attention_freq": [0, 0, 0, 1, 1, ...],  # 每层 0=dense, 1=sparse
-    "sparse_num_index_heads": 4,                    # index 头数量
-    "sparse_index_dim": 128,                        # index 头维度
-    "sparse_block_size": 128,                       # 稀疏 block 大小
-    "sparse_topk_blocks": 16,                       # top-k block 数量
-    "sparse_local_block": 1,                        # 局部 block
-    "sparse_disable_index_value": [0, 0, 0, 1, ...],# 每层 0/1 mask，1=跳过 index V/O 分支
-    "sparse_score_type": "max",                     # score 聚合方式
-}
-```
+[Minimax Sparse Attention](https://arxiv.org/abs/2606.13392) 基于GQA实现，在块粒度（Block Granularity，默认每块 128 个 Token）上选择KV Block计算attention，从而降低计算量，支持更大的上下文长度，分为以下两个步骤
 
-`Minimax-M3-preview` 的所有 sparse layer（layer 3-59）都有`sparse_disable_index_value=1`，因此实际 sparse layer 只使用`index_q_proj` / `index_k_proj` 生成 top-k block 索引，不执行`index_v_proj` / `index_o_proj` 的输出加和路径。
-
-**Sparse Layer 的 Attention 计算流程（`MiniMaxM3Attention.forward_prepare` + `forward_core`）：**
-
-```
-1. qkv_proj: hidden -> q, k, v                        # 标准 QKV 投影
-2. q_norm/k_norm: q, k -> norm_q, norm_k               # per_head QK RMSNorm
-3. rotary_emb: norm_q, norm_k -> q_rot, k_rot          # 部分维度 RoPE
-   ── 以下仅 sparse layer 执行 ──
-4. index_q/k_proj: hidden -> idx_q, idx_k              # index 分支 Q/K 投影
-5. [可选] index_v_proj: hidden -> idx_v                # M3-preview sparse layer 均跳过
-6. index_q/k_norm: idx_q, idx_k -> norm_idx_q, norm_idx_k
-7. radix_attention(q, k, v, idx_q, idx_k, idx_v)       # HybridAttnBackend 路由
-   ├── dense: flash_attention(q, k, v)                 # 标准 attention
-   └── sparse: topk_index(idx_q, idx_k, cache)         # index 分支 top-k 选择
-              + sparse_flash_attention(q, k, v, topk) # 稀疏 attention
-8. o_proj: attn_output -> output                       # 主 attention 输出投影
-9. [可选] index_o_proj: idx_o -> idx_output            # 仅 disable_index_value=False 时执行
-10. [可选] output = output + idx_output                # M3-preview sparse layer 不执行
-```
-
-SGLang 的 sparse attention backend 在 sparse layer 中返回`idx_o, attn_output`。当`disable_index_value=True` 时，`idx_o` 分支被跳过， 仅返回`o_proj(attn_output)`；当该分支启用且 TP 下存在 index head replica 时， 实现会在`index_o_proj` 前将`idx_o` 除以`idx_replica_size`，避免 all-reduce 后重复累加。
+- **索引：** 在标准 GQA 层上增加了两个投影矩阵，分别计算。首先计算并为可见的 KV 块进行评分，通过最大池化（Max-pooling）得到每个block的分数，再利用 Top-$k$ 算子为每个 Query 和 GQA 组选择得分最高的 KV 块（默认选择 $k=16$ 块，即固定 2048 个 KV Token 的计算预算）。此外，当前 Query 所在的对角块会被强制保留。
+- **计算稀疏注意力：** 仅对索引分支筛选出的 Top-$k$ 个 KV 块中的 Token 进行精确的 Softmax 稠密注意力计算。通过这种方式，它避免了全量序列的平方级计算瓶颈。
 
 ### 2.3 其他关键特征
 
 | 特征 | 说明 |
 |------|------|
 | **QK Normalization** | `qk_norm_type="per_head"`：将 Q/K reshape 为多个`head_dim` 向量后逐 head 归一化；权重形状为`(head_dim,)`，各 head 共享权重 |
-| **Partial RoPE** | `rotary_dim=64`，仅部分 head_dim 施加 RoPE，其余不动 |
-| **Gemma 风格** | `use_gemma_norm=True`，使用`x * (1 + weight)` 的 GemmaRMSNorm |
-| **Attention Output Gate** | 代码支持 dense attention 场景下的可选 gating；M3-preview 中`attention_output_gate=false`，且 sparse layer 不支持该开关 |
+| **Partial RoPE** | `rotary_dim=64`，仅部分 head_dim 施加 RoPE |
+| **Gemma 风格** | 使用`x * (1 + weight)` 的 GemmaRMSNorm |
 | **MoE + Dense 混合** | `moe_layer_freq` 前 3 层为 0，layer 3-59 为 1：前 3 层 Dense MLP，后 57 层 MoE |
-| **Sparse Attention 分布** | `sparse_attention_freq` 前 3 层为 0，layer 3-59 为 1；所有 sparse layer 均设置`sparse_disable_index_value=1` |
 | **SwiGLU 变体** | `hidden_act="swigluoai"`，带`swiglu_alpha=1.702` 和`swiglu_limit=7.0` |
-| **DP Attention** | 支持 Data Parallel Attention |
-| **LayerCommunicator** | 控制 allreduce 融合和 reduce scatter |
-| **MultiHeadRMSNorm** | 备选`qk_norm_type="multi_head"` 分支，每个 head 有独立 RMSNorm 权重；M3-preview 默认不是这个分支 |
-| **MTP (Multi-Token Prediction)** | `num_mtp_modules=1`，支持 MTP；不支持 EAGLE3 |
 
 ---
 
@@ -136,10 +110,8 @@ TensorCast 的性能建模采用 **"一算子一建模"** 架构，模型适配�
 
 MiniMax-M3 sparse layer 的计算可拆成两个建模边界，本章推导各自的 FLOPs 与访存量公式：
 
-1. **Indexer**：index K cache write → block score → top-k block 输出（projection / norm / RoPE 不在本章范围）
+1. **Indexer**：index key cache写入 → block score → top-k block 输出（projection / norm / RoPE 等操作复用现有op建模）
 2. **Sparse Attention**：主 attention 根据 top-k block 访问标准 K/V cache
-
-> 仿真侧如何把上述边界落地为虚拟 op / trace op、以及 projection / norm / RoPE 如何建模，见第 5 章。本章只关心算法本身的性能建模公式。
 
 术语约定：
 
@@ -252,48 +224,6 @@ $$
 \mathrm{write\_topk\_bytes} &= 4TNK
 \end{aligned}
 $$
-
-#### 4.1.4 Indexer 汇总
-
-将 §4.1.1–4.1.3 三个阶段的计算量与访存量汇总（projection / norm / RoPE 不在此汇总内）。
-
-$$
-\begin{aligned}
-\mathrm{MMA}_{\mathrm{indexer}}
-  &= \mathrm{index\_qk\_mma} \\
-\mathrm{GP}_{\mathrm{indexer}}
-  &= \mathrm{block\_reduce\_gp}
-   + \mathrm{topk\_gp}
-\end{aligned}
-$$
-
-代入 4.1.1 到 4.1.3 的公式后：
-
-$$
-\begin{aligned}
-\mathrm{MMA}_{\mathrm{indexer}}
-  &= 2\sum_b Q_bNL_bD \\
-\mathrm{GP}_{\mathrm{indexer}}
-  &\approx \sum_b Q_bNL_b
-   + c_{\mathrm{topk}}\sum_b Q_bNB_n
-\end{aligned}
-$$
-
-对应的逻辑访存量可按各阶段读写相加：
-
-$$
-\begin{aligned}
-\mathrm{Bytes}_{\mathrm{indexer}}
-  &\approx
-    \underbrace{2TDs}_{\text{index K cache write}} \\
-  &\quad+
-    \underbrace{TNDs + \sum_b \frac{Q_b}{B_q}NL_bDs + 4\sum_b Q_bNB_n}_{\text{block score}} \\
-  &\quad+
-    \underbrace{4\sum_b Q_bNB_n + 4TNK}_{\text{top-k selection}}
-\end{aligned}
-$$
-
-其中 index K cache 读按 vLLM `_index_block_score_kernel` 的实测行为建模：每个 128-token K-block 被加载一次后被 $B_q = 64$ 个 query token 复用（`tl.dot(q, k)`），读量为 $\sum_b \frac{Q_b}{B_q}NL_bDs$。
 
 ### 4.2 Sparse Attention
 
