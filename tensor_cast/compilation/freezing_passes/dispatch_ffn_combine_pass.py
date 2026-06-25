@@ -41,19 +41,6 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         torch.ops.tensor_cast.grouped_matmul_mxfp4_swiglu.default,
     }
 
-    _GROUPED_MATMUL_M3_SWIGLU_OPS = {
-        torch.ops.tensor_cast.grouped_matmul_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_quant_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_quant_int4_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu.default,
-    }
-
-    _GROUPED_MATMUL_M3_SWIGLU_QUANT_OPS = {
-        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default,
-        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu_quant.default,
-    }
-
     _LINEAR_FFN_OPS = {
         torch.ops.tensor_cast.static_quant_linear.default,
         torch.ops.tensor_cast.static_quant_linear_int4.default,
@@ -72,20 +59,11 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
 
     _SWIGLU_OPS = {
         torch.ops.tensor_cast.swiglu.default,
-        torch.ops.tensor_cast.m3_swiglu.default,
-        torch.ops.tensor_cast.m3_swiglu_quant.default,
         torch.ops.tensor_cast.grouped_matmul_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_quant_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_quant_int4_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_fp8_swiglu.default,
         torch.ops.tensor_cast.grouped_matmul_mxfp4_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_quant_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_quant_int4_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu.default,
-        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default,
-        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu_quant.default,
     }
 
     _DFC_OP_MAP_GMM = {
@@ -96,28 +74,11 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         torch.ops.tensor_cast.grouped_matmul_mxfp4_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_mxfp4.default,
     }
 
-    _DFC_OP_MAP_M3_GMM = {
-        torch.ops.tensor_cast.grouped_matmul_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_m3.default,
-        torch.ops.tensor_cast.grouped_matmul_quant_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_quant_m3.default,
-        torch.ops.tensor_cast.grouped_matmul_quant_int4_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_quant_int4_m3.default,
-        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_fp8_m3.default,
-        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu.default: torch.ops.tensor_cast.dispatch_ffn_combine_mxfp4_m3.default,
-        torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default: torch.ops.tensor_cast.dispatch_ffn_combine_fp8_m3.default,
-        torch.ops.tensor_cast.grouped_matmul_mxfp4_m3_swiglu_quant.default: torch.ops.tensor_cast.dispatch_ffn_combine_mxfp4_m3.default,
-    }
-
     _DFC_OP_MAP_LINEAR = {
         torch.ops.tensor_cast.static_quant_linear.default: torch.ops.tensor_cast.dispatch_ffn_combine_quant.default,
         torch.ops.tensor_cast.static_quant_linear_int4.default: torch.ops.tensor_cast.dispatch_ffn_combine_quant_int4.default,
         torch.ops.tensor_cast.fp8_linear.default: torch.ops.tensor_cast.dispatch_ffn_combine_fp8.default,
         torch.ops.tensor_cast.mxfp4_linear.default: torch.ops.tensor_cast.dispatch_ffn_combine_mxfp4.default,
-    }
-
-    _DFC_OP_MAP_M3_LINEAR = {
-        torch.ops.tensor_cast.static_quant_linear.default: torch.ops.tensor_cast.dispatch_ffn_combine_quant_m3.default,
-        torch.ops.tensor_cast.static_quant_linear_int4.default: torch.ops.tensor_cast.dispatch_ffn_combine_quant_int4_m3.default,
-        torch.ops.tensor_cast.fp8_linear.default: torch.ops.tensor_cast.dispatch_ffn_combine_fp8_m3.default,
-        torch.ops.tensor_cast.mxfp4_linear.default: torch.ops.tensor_cast.dispatch_ffn_combine_mxfp4_m3.default,
     }
 
     _MAX_TRAVERSE_DEPTH = 600
@@ -213,50 +174,27 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
             rank_node = 0
             rank_group_node = [0]
 
-        # Detect if region contains M3 swiglu ops
-        is_m3 = any(
-            node.op == "call_function" and node.target in self._GROUPED_MATMUL_M3_SWIGLU_OPS
-            for node in region_nodes
-        ) or any(
-            node.op == "call_function" and node.target in self._GROUPED_MATMUL_M3_SWIGLU_QUANT_OPS
-            for node in region_nodes
-        ) or any(
-            node.op == "call_function" and node.target in (torch.ops.tensor_cast.m3_swiglu.default, torch.ops.tensor_cast.m3_swiglu_quant.default)
-            for node in region_nodes
-        )
-
         # Case 1: Grouped ops (after SinkSplit + GroupedMatmulSwigluPass)
         gmm_swiglu_node = None
         gmm_plain_node = None
         for node in region_nodes:
-            if self._is_grouped_matmul_swiglu(node) or self._is_grouped_matmul_m3_swiglu(node):
+            if self._is_grouped_matmul_swiglu(node):
                 gmm_swiglu_node = node
             elif self._is_grouped_matmul(node):
                 gmm_plain_node = node
 
         if gmm_swiglu_node is not None and gmm_plain_node is not None:
-            if is_m3:
-                dfc_target = self._DFC_OP_MAP_M3_GMM.get(gmm_swiglu_node.target)
-            else:
-                dfc_target = self._DFC_OP_MAP_GMM.get(gmm_swiglu_node.target)
+            dfc_target = self._DFC_OP_MAP_GMM.get(gmm_swiglu_node.target)
             if dfc_target is None:
                 return None
 
-            extra_args = ()
-            if is_m3 and len(gmm_swiglu_node.args) >= 3:
-                # grouped_matmul_*_m3_swiglu has extra alpha, limit args at the end
-                # args signature: (x_list, w_list, bias_list, ..., alpha, limit)
-                alpha = gmm_swiglu_node.args[-2]
-                limit = gmm_swiglu_node.args[-1]
-                extra_args = (alpha, limit)
-
             return (
                 dfc_target,
-                self._extract_grouped_gmm_args(gmm_swiglu_node, is_m3),
-                self._extract_grouped_gmm_args(gmm_plain_node, False),
+                self._extract_grouped_gmm_args(gmm_swiglu_node),
+                self._extract_grouped_gmm_args(gmm_plain_node),
                 rank_node,
                 rank_group_node,
-                extra_args,
+                (),
             )
 
         if gmm_swiglu_node is not None and gmm_plain_node is None:
@@ -270,10 +208,7 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         swiglu_nodes = []
         linear_nodes = []
         for node in region_nodes:
-            if node.op == "call_function" and node.target in (
-                torch.ops.tensor_cast.swiglu.default,
-                torch.ops.tensor_cast.m3_swiglu.default,
-            ):
+            if node.op == "call_function" and node.target == torch.ops.tensor_cast.swiglu.default:
                 swiglu_nodes.append(node)
             if self._is_linear_ffn(node):
                 linear_nodes.append(node)
@@ -283,10 +218,7 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
             return None
 
         linear_target = linear_nodes[0].target
-        if is_m3:
-            dfc_target = self._DFC_OP_MAP_M3_LINEAR.get(linear_target)
-        else:
-            dfc_target = self._DFC_OP_MAP_LINEAR.get(linear_target)
+        dfc_target = self._DFC_OP_MAP_LINEAR.get(linear_target)
         if dfc_target is None:
             logger.debug("DFC: unmapped linear target=%s", linear_target)
             return None
@@ -318,15 +250,7 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
         gmm1_w_args = self._collect_linear_args_as_lists(gate_up_linears)
         gmm2_w_args = self._collect_linear_args_as_lists(down_linears)
 
-        extra_args = ()
-        if is_m3 and swiglu_nodes:
-            first_swiglu = swiglu_nodes[0]
-            if first_swiglu.target == torch.ops.tensor_cast.m3_swiglu.default and len(first_swiglu.args) >= 4:
-                alpha = first_swiglu.args[2]
-                limit = first_swiglu.args[3]
-                extra_args = (alpha, limit)
-
-        return (dfc_target, gmm1_w_args, gmm2_w_args, rank_node, rank_group_node, extra_args)
+        return (dfc_target, gmm1_w_args, gmm2_w_args, rank_node, rank_group_node, ())
 
     @staticmethod
     def _collect_linear_args_as_lists(linear_nodes: list) -> tuple:
@@ -367,15 +291,12 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
 
         return predecessors
 
-    def _extract_grouped_gmm_args(self, node: fx.Node, is_m3: bool) -> tuple:
+    def _extract_grouped_gmm_args(self, node: fx.Node) -> tuple:
         arg_indices = self._get_weight_only_arg_indices(node.target)
         if arg_indices is not None:
             for i in arg_indices:
                 self._check_node_arg_index(node, i)
             return tuple(node.args[i] for i in arg_indices)
-        # For non-quant ops and M3, skip activation (args[0]) and trailing alpha/limit
-        if is_m3:
-            return node.args[1:-2]
         return node.args[1:]
 
     @classmethod
@@ -453,9 +374,6 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
     def _is_grouped_matmul_swiglu(self, node: fx.Node) -> bool:
         return node.op == "call_function" and node.target in self._GROUPED_MATMUL_SWIGLU_OPS
 
-    def _is_grouped_matmul_m3_swiglu(self, node: fx.Node) -> bool:
-        return node.op == "call_function" and node.target in self._GROUPED_MATMUL_M3_SWIGLU_OPS or node.target in self._GROUPED_MATMUL_M3_SWIGLU_QUANT_OPS
-
     def _is_linear_ffn(self, node: fx.Node) -> bool:
         return node.op == "call_function" and node.target in self._LINEAR_FFN_OPS
 
@@ -476,7 +394,7 @@ class DispatchFFNCombinePass(TensorCastGraphModulePass):
                 has_permute = True
             if self._is_unpermute_token(node):
                 has_unpermute = True
-            if self._is_grouped_matmul(node) or self._is_grouped_matmul_swiglu(node) or self._is_grouped_matmul_m3_swiglu(node) or self._is_linear_ffn(node):
+            if self._is_grouped_matmul(node) or self._is_grouped_matmul_swiglu(node) or self._is_linear_ffn(node):
                 has_ffn_compute = True
             if self._is_swiglu(node):
                 has_swiglu = True

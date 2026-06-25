@@ -355,11 +355,11 @@ def _run_m3_moe_fp8_freezing_passes(gm: torch.fx.GraphModule, inputs):
 
 
 def test_minimax_m3_moe_fp8_freezing_passes_fuse_gmm_swiglu_and_down():
-    """M3 expert graph should match DeepSeek: GMM+m3_swiglu_quant, then down GMM."""
+    """M3 FP8 expert: gate/up/down GMM fusion; m3_swiglu_quant stays separate (tuple output)."""
     dq = torch.ops.tensor_cast.dynamic_quantize_symmetric.default
     fp8 = torch.ops.tensor_cast.fp8_linear.default
     gmm = torch.ops.tensor_cast.grouped_matmul_fp8.default
-    gmm_m3 = torch.ops.tensor_cast.grouped_matmul_fp8_m3_swiglu_quant.default
+    gmm_fp8_swiglu = torch.ops.tensor_cast.grouped_matmul_fp8_swiglu.default
     m3sq = torch.ops.tensor_cast.m3_swiglu_quant.default
     split = torch.ops.aten.split_with_sizes.default
 
@@ -400,6 +400,6 @@ def test_minimax_m3_moe_fp8_freezing_passes_fuse_gmm_swiglu_and_down():
         return sum(1 for node in gm.graph.nodes if node.target == target)
 
     assert _count(fp8) == 0
-    assert _count(m3sq) == 0
-    assert _count(gmm_m3) == 1
-    assert _count(gmm) == 1
+    assert _count(m3sq) == 1
+    assert _count(gmm_fp8_swiglu) == 0
+    assert _count(gmm) == 2
